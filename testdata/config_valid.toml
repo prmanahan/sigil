@@ -1,0 +1,6 @@
+op_key_ref = "op://vault/item/private-key.pem"
+app_id = 42
+
+[installations]
+"owner-a" = 100
+"owner-b" = 200

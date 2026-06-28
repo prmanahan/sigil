@@ -1,0 +1,21 @@
+# Sigil config — copy to ~/.config/sigil/config.toml and fill in.
+#
+# NON-SECRET values only. The 1Password service-account token
+# (OP_SERVICE_ACCOUNT_TOKEN) comes from the environment (macOS Keychain),
+# never from this file. The GitHub App private key stays in 1Password and is
+# read in-process at run time via op_key_ref below — never copied to disk.
+
+# 1Password secret reference to the GitHub App private key. The key is stored
+# as a FILE attachment on a secure-note item, so the reference ends in the
+# attached file's name. Prefer a STABLE file name over a dated one so this
+# reference survives key rotation.
+op_key_ref = "op://<vault>/<item>/<private-key-file>.pem"
+
+# GitHub App ID — the JWT `iss`. Non-secret (it appears in the App's URL).
+app_id = 0
+
+# Route by repo owner -> installation ID. One entry per install target
+# (e.g. your personal account and any org the App is installed on).
+[installations]
+# "your-personal-account" = 0
+# "your-org"              = 0

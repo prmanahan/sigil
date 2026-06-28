@@ -6,10 +6,16 @@
 *.out
 /dist/
 
+# Merge workflow artifact — read by /merge, never committed
+/MERGE_MESSAGE
+
 # Secrets — never commit (defense in depth)
 *.pem
 config.toml
 .env
+
+# Harness / hook state (leaks in when cwd is the repo)
+.claude/
 
 # OS
 .DS_Store

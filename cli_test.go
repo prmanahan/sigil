@@ -1,0 +1,553 @@
+package main_test
+
+// AC#5 + AC#7: Black-box CLI tests for Sigil's credential-helper protocol and leak scan.
+//
+// These tests build the sigil binary and exec it, testing only its externally
+// observable behaviour (stdin/stdout/stderr/exit-code). No implementation details
+// are assumed. The SIGIL_GITHUB_API_URL env var is the sole testable seam for
+// redirecting GitHub API calls.
+//
+// Red state: tests compile fine but fail at runtime because the current binary
+// is the Layer-B 1Password smoke test, not the real credential helper. That is
+// the expected red.
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// binaryPath is set by TestMain after building the binary.
+var binaryPath string
+
+// TestMain builds the sigil binary once for all CLI tests.
+func TestMain(m *testing.M) {
+	tmp, err := os.MkdirTemp("", "sigil-cli-test-*")
+	if err != nil {
+		panic("MkdirTemp: " + err.Error())
+	}
+	defer os.RemoveAll(tmp)
+
+	binaryPath = filepath.Join(tmp, "sigil")
+
+	// go build runs in the current working directory, which go test sets to the
+	// package directory (the worktree root).
+	out, err := exec.Command("go", "build", "-o", binaryPath, ".").CombinedOutput()
+	if err != nil {
+		panic("build failed: " + string(out))
+	}
+
+	os.Exit(m.Run())
+}
+
+// runResult holds the output of a sigil invocation.
+type runResult struct {
+	stdout   string
+	stderr   string
+	exitCode int
+}
+
+// runSigil executes the sigil binary with the given args, stdin, and additional
+// environment entries (appended to the current process env).
+func runSigil(t *testing.T, args []string, stdin string, extraEnv []string) runResult {
+	t.Helper()
+	cmd := exec.Command(binaryPath, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+
+	cmd.Env = append(os.Environ(), extraEnv...)
+
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	code := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("exec.Command(%v) failed unexpectedly: %v", args, err)
+		}
+	}
+	return runResult{
+		stdout:   outBuf.String(),
+		stderr:   errBuf.String(),
+		exitCode: code,
+	}
+}
+
+// envWithout returns a copy of os.Environ() without entries whose key matches key.
+func envWithout(key string) []string {
+	prefix := key + "="
+	env := os.Environ()
+	result := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+// writeTempConfig creates a temporary $HOME directory with the sigil config at
+// $HOME/.config/sigil/config.toml. Returns the HOME path.
+func writeTempConfig(t *testing.T, content string) string {
+	t.Helper()
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".config", "sigil")
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		t.Fatalf("MkdirAll config dir: %v", err)
+	}
+	configPath := filepath.Join(configDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		t.Fatalf("WriteFile config: %v", err)
+	}
+	return home
+}
+
+// skipIfNoOPToken skips the test if OP_SERVICE_ACCOUNT_TOKEN is not set.
+// Used for integration tests that require a real 1Password service account.
+func skipIfNoOPToken(t *testing.T) {
+	t.Helper()
+	if os.Getenv("OP_SERVICE_ACCOUNT_TOKEN") == "" {
+		t.Skip("OP_SERVICE_ACCOUNT_TOKEN not set — skipping 1Password integration test")
+	}
+}
+
+// minimalConfig returns a config file body suitable for tests that need a valid
+// config but whose code paths don't actually reach 1Password.
+func minimalConfig(opKeyRef string, appID int, installID int, owner string) string {
+	return fmt.Sprintf(`op_key_ref = %q
+app_id = %d
+
+[installations]
+%q = %d
+`, opKeyRef, appID, owner, installID)
+}
+
+// --- AC#5: Credential-helper protocol ---
+
+// TestCLI_HelperGet_NonGitHubHost verifies that a credential request for a
+// non-GitHub host produces no output and exits 0 (no-op, per the spec).
+func TestCLI_HelperGet_NonGitHubHost(t *testing.T) {
+	// Given: stdin with a non-GitHub host
+	stdin := "protocol=https\nhost=example.com\npath=owner/repo\n\n"
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "owner"))
+
+	// When: sigil get is called
+	result := runSigil(t, []string{"get"}, stdin, []string{
+		"HOME=" + home,
+	})
+
+	// Then: no output, exit 0
+	if result.exitCode != 0 {
+		t.Errorf("exit code: got %d, want 0 for non-GitHub host", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout: expected empty for non-GitHub host, got %q", result.stdout)
+	}
+}
+
+// TestCLI_HelperStore_NoOp verifies that the `store` action is a no-op: no output,
+// exit 0, as required by the git credential-helper protocol.
+func TestCLI_HelperStore_NoOp(t *testing.T) {
+	// Given: stdin with a store request
+	stdin := "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghs_fake\n\n"
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "owner"))
+
+	// When: sigil store is called
+	result := runSigil(t, []string{"store"}, stdin, []string{"HOME=" + home})
+
+	// Then: no output, exit 0
+	if result.exitCode != 0 {
+		t.Errorf("exit code: got %d, want 0 for store no-op", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout: expected empty for store, got %q", result.stdout)
+	}
+}
+
+// TestCLI_HelperErase_NoOp verifies that the `erase` action is a no-op: no output,
+// exit 0, as required by the git credential-helper protocol.
+func TestCLI_HelperErase_NoOp(t *testing.T) {
+	// Given: stdin with an erase request
+	stdin := "protocol=https\nhost=github.com\npath=owner/repo\n\n"
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "owner"))
+
+	// When: sigil erase is called
+	result := runSigil(t, []string{"erase"}, stdin, []string{"HOME=" + home})
+
+	// Then: no output, exit 0
+	if result.exitCode != 0 {
+		t.Errorf("exit code: got %d, want 0 for erase no-op", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout: expected empty for erase, got %q", result.stdout)
+	}
+}
+
+// TestCLI_HelperGet_ValidGitHubPath verifies the full AC#5 happy path:
+// stdin with a GitHub HTTPS path → stdout containing username and password lines.
+// Requires a real 1Password service account token (OP_SERVICE_ACCOUNT_TOKEN).
+func TestCLI_HelperGet_ValidGitHubPath(t *testing.T) {
+	skipIfNoOPToken(t)
+
+	// Given: a mock GitHub API server and a valid config
+	const installID = 12345
+	const fakeToken = "ghs_mock_installation_token"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{
+			"token":      fakeToken,
+			"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+	}))
+	defer srv.Close()
+
+	// Use real op_key_ref from the environment (as in actual usage)
+	opKeyRef := os.Getenv("SIGIL_TEST_OP_KEY_REF")
+	if opKeyRef == "" {
+		t.Skip("SIGIL_TEST_OP_KEY_REF not set — skipping full integration test")
+	}
+	home := writeTempConfig(t, minimalConfig(opKeyRef, 42, installID, "test-owner"))
+
+	stdin := "protocol=https\nhost=github.com\npath=test-owner/repo\n\n"
+
+	// When: sigil get is called with the mock API URL
+	result := runSigil(t, []string{"get"}, stdin, []string{
+		"HOME=" + home,
+		"SIGIL_GITHUB_API_URL=" + srv.URL,
+	})
+
+	// Then: exit 0
+	if result.exitCode != 0 {
+		t.Errorf("exit code: got %d, want 0\nstderr: %s", result.exitCode, result.stderr)
+	}
+
+	// And: stdout contains username=x-access-token
+	if !strings.Contains(result.stdout, "username=x-access-token") {
+		t.Errorf("stdout missing 'username=x-access-token':\n%s", result.stdout)
+	}
+
+	// And: stdout contains password=<some token>
+	if !strings.Contains(result.stdout, "password=") {
+		t.Errorf("stdout missing 'password=' line:\n%s", result.stdout)
+	}
+}
+
+// TestCLI_BareInvocation_ActsAsGet verifies that calling sigil with no subcommand
+// (which is how git invokes credential helpers) behaves identically to `sigil get`.
+func TestCLI_BareInvocation_NonGitHubHostIsNoOp(t *testing.T) {
+	// Given: stdin with a non-GitHub host and no subcommand
+	stdin := "protocol=ssh\nhost=bitbucket.org\npath=owner/repo\n\n"
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "owner"))
+
+	// When: sigil is called with no args (bare invocation)
+	result := runSigil(t, []string{}, stdin, []string{"HOME=" + home})
+
+	// Then: no output, exit 0 (non-GitHub, no-op)
+	if result.exitCode != 0 {
+		t.Errorf("exit code: got %d, want 0 for bare invocation / non-GitHub host", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout: expected empty, got %q", result.stdout)
+	}
+}
+
+// --- Error / exit-code paths ---
+
+// TestCLI_MissingConfig_ExitsNonZero verifies that a missing config file causes
+// sigil to exit non-zero rather than silently emitting no credentials.
+func TestCLI_MissingConfig_ExitsNonZero(t *testing.T) {
+	// Given: a HOME that has no sigil config
+	emptyHome := t.TempDir()
+	stdin := "protocol=https\nhost=github.com\npath=owner/repo\n\n"
+
+	// When: sigil get is called
+	result := runSigil(t, []string{"get"}, stdin, []string{
+		"HOME=" + emptyHome,
+	})
+
+	// Then: exits non-zero (fail closed)
+	if result.exitCode == 0 {
+		t.Errorf("expected non-zero exit when config is missing, got 0\nstdout: %s", result.stdout)
+	}
+}
+
+// TestCLI_UnknownOwner_ExitsNonZero verifies that a request for a repo whose owner
+// is not in the installations map causes sigil to fail closed with non-zero exit.
+func TestCLI_UnknownOwner_ExitsNonZero(t *testing.T) {
+	// Given: a config that only knows about "known-owner"
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "known-owner"))
+	stdin := "protocol=https\nhost=github.com\npath=unknown-owner/repo\n\n"
+
+	// When: sigil get is called for an unknown owner
+	result := runSigil(t, []string{"get"}, stdin, []string{
+		"HOME=" + home,
+	})
+
+	// Then: exits non-zero (fail closed — unknown owner is an error)
+	if result.exitCode == 0 {
+		t.Errorf("expected non-zero exit for unknown owner (fail-closed), got 0\nstdout: %s", result.stdout)
+	}
+}
+
+// TestCLI_MissingOPServiceAccountToken_ExitsNonZero verifies that if
+// OP_SERVICE_ACCOUNT_TOKEN is not set, sigil fails closed with non-zero exit
+// for a GitHub credential request (requires the token to mint a JWT).
+func TestCLI_MissingOPServiceAccountToken_ExitsNonZero(t *testing.T) {
+	// Given: a valid config but no OP_SERVICE_ACCOUNT_TOKEN in the environment
+	home := writeTempConfig(t, minimalConfig("op://vault/item/key.pem", 42, 12345, "myorg"))
+	stdin := "protocol=https\nhost=github.com\npath=myorg/repo\n\n"
+
+	// Build an environment without OP_SERVICE_ACCOUNT_TOKEN
+	env := envWithout("OP_SERVICE_ACCOUNT_TOKEN")
+	env = append(env, "HOME="+home)
+
+	// When: sigil get is called with env that has no OP_SERVICE_ACCOUNT_TOKEN
+	// (exec.Command.Env replaces the full env, unlike runSigil which appends)
+	cmd := exec.Command(binaryPath, "get")
+	cmd.Stdin = strings.NewReader(stdin)
+	cmd.Env = env
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	exitCode := 0
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	result := runResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: exitCode}
+
+	// Then: exits non-zero (fail closed)
+	if result.exitCode == 0 {
+		t.Errorf("expected non-zero exit with OP_SERVICE_ACCOUNT_TOKEN unset, got 0\nstdout: %s", result.stdout)
+	}
+}
+
+// --- sigil token subcommand ---
+
+// TestCLI_TokenSubcommand_MissingConfig_ExitsNonZero verifies that `sigil token`
+// fails closed when no config is present.
+func TestCLI_TokenSubcommand_MissingConfig_ExitsNonZero(t *testing.T) {
+	// Given: an empty HOME with no config
+	emptyHome := t.TempDir()
+
+	// When: sigil token <owner> is called
+	result := runSigil(t, []string{"token", "myorg"}, "", []string{"HOME=" + emptyHome})
+
+	// Then: exits non-zero
+	if result.exitCode == 0 {
+		t.Errorf("expected non-zero exit for missing config in 'sigil token', got 0")
+	}
+}
+
+// TestCLI_TokenSubcommand_UnknownOwner_ExitsNonZero verifies that `sigil token`
+// fails closed when the owner is not in the installations map.
+func TestCLI_TokenSubcommand_UnknownOwner_ExitsNonZero(t *testing.T) {
+	// Given: a config with a known owner, but requesting a different one
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "known-owner"))
+
+	// When: sigil token is called for an unknown owner
+	result := runSigil(t, []string{"token", "unknown-owner"}, "", []string{"HOME=" + home})
+
+	// Then: exits non-zero (fail closed)
+	if result.exitCode == 0 {
+		t.Errorf("expected non-zero exit for unknown owner in 'sigil token', got 0")
+	}
+}
+
+// --- sigil doctor subcommand ---
+
+// TestCLI_DoctorSubcommand_MissingConfig_ExitsNonZero verifies that `sigil doctor`
+// exits non-zero when no config is present.
+func TestCLI_DoctorSubcommand_MissingConfig_ExitsNonZero(t *testing.T) {
+	// Given: an empty HOME
+	emptyHome := t.TempDir()
+
+	// When: sigil doctor is called
+	result := runSigil(t, []string{"doctor"}, "", []string{"HOME=" + emptyHome})
+
+	// Then: exits non-zero (can't verify setup without a config)
+	if result.exitCode == 0 {
+		t.Errorf("expected non-zero exit for 'sigil doctor' with no config, got 0")
+	}
+}
+
+// --- AC#7: Leak scan ---
+
+// TestCLI_InsecureAPIBaseURL_ExitsNonZero verifies that SIGIL_GITHUB_API_URL with a
+// non-https non-loopback scheme causes sigil to fail closed before reading any
+// credential, with an error message that mentions the scheme or https requirement.
+//
+// Loopback addresses (http://127.0.0.1) MUST remain allowed — existing httptest
+// tests rely on them. Only cleartext to a remote host is rejected.
+//
+// L1 status: RED. Current code validates no scheme: cmdToken calls readKey before
+// any URL inspection, so the error is "OP_SERVICE_ACCOUNT_TOKEN is not set" (stderr
+// does not mention https/scheme). Forge must validate the API base URL scheme
+// BEFORE readKey so the check is credential-free.
+//
+// OP_SERVICE_ACCOUNT_TOKEN is stripped from the environment to make the test
+// deterministic regardless of the CI/developer environment.
+func TestCLI_InsecureAPIBaseURL_ExitsNonZero(t *testing.T) {
+	// Given: a valid config with a known owner, and a cleartext remote API URL.
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "myorg"))
+
+	// Strip OP_SERVICE_ACCOUNT_TOKEN so behaviour is independent of the environment
+	// (scheme validation must fire before the key-read — testable without credentials).
+	env := envWithout("OP_SERVICE_ACCOUNT_TOKEN")
+	env = append(env,
+		"HOME="+home,
+		"SIGIL_GITHUB_API_URL=http://evil.example.com",
+	)
+
+	// When: sigil token is called with the insecure API URL.
+	cmd := exec.Command(binaryPath, "token", "myorg")
+	cmd.Env = env
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	exitCode := 0
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	result := runResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: exitCode}
+
+	// Then: non-zero exit (fail closed before any credential read).
+	if result.exitCode == 0 {
+		t.Errorf("expected non-zero exit for insecure API URL, got 0\nstdout: %s\nstderr: %s",
+			result.stdout, result.stderr)
+	}
+	// And: the error message mentions the scheme or https requirement.
+	if !strings.Contains(result.stderr, "https") && !strings.Contains(result.stderr, "scheme") {
+		t.Errorf("stderr must mention 'https' or 'scheme' for insecure-URL error; got: %s", result.stderr)
+	}
+}
+
+// TestCLI_LeakScan_NoPEMMarkersInOutput verifies that PEM private-key markers never
+// appear in stdout or stderr across error-path invocations.
+// These paths do not need 1Password credentials.
+func TestCLI_LeakScan_NoPEMMarkersInOutput(t *testing.T) {
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "owner"))
+	pemMarkers := []string{
+		"BEGIN RSA PRIVATE KEY",
+		"END RSA PRIVATE KEY",
+		"BEGIN PRIVATE KEY",
+		"END PRIVATE KEY",
+		"BEGIN EC PRIVATE KEY",
+	}
+
+	// Run several invocations that are expected to fail (error paths)
+	invocations := []struct {
+		name  string
+		args  []string
+		stdin string
+		env   []string
+	}{
+		{
+			name:  "missing config",
+			args:  []string{"get"},
+			stdin: "protocol=https\nhost=github.com\npath=owner/repo\n\n",
+			env:   []string{"HOME=" + t.TempDir()},
+		},
+		{
+			name:  "unknown owner",
+			args:  []string{"get"},
+			stdin: "protocol=https\nhost=github.com\npath=nobody/repo\n\n",
+			env:   []string{"HOME=" + home},
+		},
+		{
+			name:  "non-github host",
+			args:  []string{"get"},
+			stdin: "protocol=https\nhost=gitlab.com\npath=owner/repo\n\n",
+			env:   []string{"HOME=" + home},
+		},
+		{
+			name:  "store no-op",
+			args:  []string{"store"},
+			stdin: "protocol=https\nhost=github.com\npassword=ghs_whatever\n\n",
+			env:   []string{"HOME=" + home},
+		},
+	}
+
+	for _, inv := range invocations {
+		t.Run(inv.name, func(t *testing.T) {
+			// Given: an invocation expected to produce output (or error output)
+			result := runSigil(t, inv.args, inv.stdin, inv.env)
+			combined := result.stdout + result.stderr
+
+			// Then: no PEM markers appear in any output
+			for _, marker := range pemMarkers {
+				if strings.Contains(combined, marker) {
+					t.Errorf("invocation %q: PEM marker %q found in output — key material leak\nstdout: %s\nstderr: %s",
+						inv.name, marker, result.stdout, result.stderr)
+				}
+			}
+		})
+	}
+}
+
+// TestCLI_LeakScan_TokenNotInStderr verifies that if a token is returned via the
+// sanctioned `password=` channel in stdout, the same token value does NOT appear
+// in stderr. This is the channel-separation invariant.
+// Requires 1Password credentials.
+func TestCLI_LeakScan_TokenNotInStderr(t *testing.T) {
+	skipIfNoOPToken(t)
+
+	opKeyRef := os.Getenv("SIGIL_TEST_OP_KEY_REF")
+	if opKeyRef == "" {
+		t.Skip("SIGIL_TEST_OP_KEY_REF not set")
+	}
+
+	const installID = 12345
+	const issuedToken = "ghs_issued_token_for_leak_check"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{
+			"token":      issuedToken,
+			"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+	}))
+	defer srv.Close()
+
+	home := writeTempConfig(t, minimalConfig(opKeyRef, 42, installID, "leak-test-owner"))
+	stdin := "protocol=https\nhost=github.com\npath=leak-test-owner/repo\n\n"
+
+	result := runSigil(t, []string{"get"}, stdin, []string{
+		"HOME=" + home,
+		"SIGIL_GITHUB_API_URL=" + srv.URL,
+	})
+
+	// Given: the token may appear in the sanctioned stdout "password=" line
+	// Then: the token must NOT appear in stderr (unsanctioned channel)
+	if strings.Contains(result.stderr, issuedToken) {
+		t.Errorf("installation token appeared in stderr — unsanctioned channel leak\nstderr: %s", result.stderr)
+	}
+
+	// And: no PEM markers in any channel
+	combined := result.stdout + result.stderr
+	for _, marker := range []string{"BEGIN RSA PRIVATE KEY", "BEGIN PRIVATE KEY"} {
+		if strings.Contains(combined, marker) {
+			t.Errorf("PEM marker %q in output — key material leak", marker)
+		}
+	}
+}

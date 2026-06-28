@@ -3,7 +3,12 @@ module github.com/prmanahan/sigil
 go 1.26.4
 
 require (
-	github.com/1password/onepassword-sdk-go v0.4.0 // indirect
+	github.com/1password/onepassword-sdk-go v0.4.0
+	github.com/BurntSushi/toml v1.6.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
+)
+
+require (
 	github.com/dylibso/observe-sdk/go v0.0.0-20240828172851-9145d8ad07e1 // indirect
 	github.com/extism/go-sdk v1.7.1 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
