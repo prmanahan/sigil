@@ -1,0 +1,15 @@
+# Compiled binary
+/sigil
+
+# Go build/test artifacts
+*.test
+*.out
+/dist/
+
+# Secrets — never commit (defense in depth)
+*.pem
+config.toml
+.env
+
+# OS
+.DS_Store
