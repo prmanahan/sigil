@@ -263,7 +263,8 @@ environment, placed there by the wrapper.
 | Command | Does |
 |---|---|
 | `sigil` / `sigil get` | The credential-helper path. Reads a request on stdin, writes credentials to stdout. |
-| `sigil token <owner>` | Prints an installation token for that owner. Useful for scripting and debugging. |
+| `sigil token <owner>` | Prints a full-permission installation token for that owner (cached). Useful for scripting and debugging. |
+| `sigil token --rate-limit-only <owner>/<repo>` | Prints a token narrowed to `metadata:read` on exactly one repo — just enough to raise the REST rate limit, nothing else. GitHub's actual grant is verified before the token is printed; a mismatch revokes it and errors instead. Never cached — a one-shot credential for an unattended run whose environment untrusted code may inherit. |
 | `sigil doctor` | Checks config, the environment token, the key read, and a JWT mint — **without contacting GitHub**. Prints only counts and sizes, never key or token material. The cheapest smoke test. |
 | `sigil store` / `sigil erase` | No-ops. Git expects them to exist; Sigil has nothing to store or erase. |
 
