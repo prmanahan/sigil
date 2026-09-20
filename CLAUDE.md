@@ -54,6 +54,20 @@ argument-polarity and empty-body tests; skip count is unchanged (still gated on
 `OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`, per the table
 below).
 
+**Re-measured 2026-09-20 after `#3667` (the `sigil token <owner>` TTY gate) and its
+Warden-review follow-up: still green, exit 0, ~3.7 s cold. 85 top-level tests pass, 2 skip, 0
+fail.** ⚠ **State the counting method, because it has already drifted once**: this number is
+top-level only — `go test -count=1 -v ./...` then `grep -c '^--- PASS'` and `'^--- SKIP'`,
+which counts neither subtests nor `TestMain`. The tree holds 88 `func Test`; one is `TestMain`,
+leaving 87 top-level tests = 85 pass + 2 skip. The move from 77 is `#3667`'s **+9** (five
+`tty_test.go` unit tests on the gate, four `cli_test.go` black-box tests pinning *which* paths
+are gated) **−1** (the follow-up deleted `TestCLI_TokenSubcommand_UnknownOwner_ExitsNonZero`,
+whose name never described what it asserted — it always exited at the key read, never at
+routing). ⛔ **The skip count is unchanged at 2 and still gated on `OP_SERVICE_ACCOUNT_TOKEN` +
+`SIGIL_TEST_OP_KEY_REF`** — `#3667` added no skips and closed none of the gaps in the table
+below. ⚠ `just check` prints `(cached)` on a warm test cache; `go clean -testcache` first when
+the run itself is the evidence.
+
 **`check` has no `build` recipe and does not need one.** `cli_test.go`'s `TestMain` runs
 `go build` into a temp dir and panics on failure *before* any test executes, and Go compiles
 the internal and external test packages into one binary with one `TestMain`. So the build
@@ -219,7 +233,7 @@ from the remote. Peter: *"merge skill is fixable we own it, so not critical."*
 
 ## Security invariants — do not regress these
 
-Stated at `main.go:18-31`. Each names what breaking it costs.
+Stated at `main.go:20-39`. Each names what breaking it costs.
 
 - **The App private key never touches disk.** Resolved in-process from 1Password over the API,
   parsed from memory. ⇒ Breaking it puts the root credential that mints every token on disk;
@@ -254,9 +268,40 @@ Stated at `main.go:18-31`. Each names what breaking it costs.
   "all"`, not zero repositories. Both are exactly the class this verification exists to catch —
   do not weaken `verifyNarrowedGrant` to a single `permissions["metadata"]=="read"` check, which
   passes the first of these two silently.
+- **The full-permission `sigil token <owner>` refuses a non-terminal stdout** (`#3667`), from
+  the credential-free preflight band: after the scheme check, before the key read, before any
+  network call — so a refused run reads no secret and makes no `access_tokens` POST. ⇒ Breaking
+  it turns the ordinary unattended invocation (a pipe, a redirect to a file, an agent shell)
+  from a loud immediate failure back into a silent mint.
+  ⛔ **This one is a SPEED BUMP, NOT A BOUNDARY — and this section is exactly where that gets
+  misread.** Four gaps are enumerated at `requireTerminalStdout` in `main.go` and all four are
+  open: `sigil get` is itself an unattended full-permission token printer by design (see
+  gotchas — it dominates the other three); the cache already holds a live token on disk, so
+  `sigil token <owner> > /dev/null` mints into the cache rather than wasting the mint; a pty
+  walks straight through and **need not even be allocated** — measured 2026-09-20, a bare
+  `> /dev/ttysNNN` into a live tmux pane this user already owns (12 such devices existed that
+  day; the device number is whatever tmux allocated, not a fixed path), read back with `tmux
+  capture-pane -p`; and `/dev/null` is a character device, so that redirect is permitted.
+  The gate narrows the *accidental* case to a loud failure. The agent permission rule is what
+  keeps this command out of unattended runs, and nothing here replaces it.
 
 ## Per-repo gotchas
 
+- ⛔ **`sigil get` IS an on-demand, non-interactive, FULL-PERMISSION token printer — by design,
+  and it dominates every bypass the `#3667` TTY gate documents.** Three lines on stdin —
+  `protocol=https`, `host=github.com`, `path=<owner>/<anything>` — and it writes
+  `username=x-access-token` / `password=<full-permission installation token>` to stdout under a
+  **pipe**. No pty, no prior git operation, no cache read, no subcommand, nothing the gate is
+  near. ⚠ **`resolveInstallation` reads only the FIRST path segment**, so the repo half is
+  arbitrary: `path=myorg/x` routes identically to `path=myorg/real-repo`. This is **required,
+  not a defect** — git drives the credential helper over pipes on every invocation, so gating it
+  would break every git operation on every wired repository, and `#3667` AC#5 mandates leaving
+  it alone. A stdout gate structurally cannot reach it. ⇒ **Do not read the `sigil token` TTY
+  gate as controlling access to full-permission tokens**: the cheaper, fully-supported,
+  unattended path to the same credential is the helper itself. **`#3673`** is the filed
+  follow-up — narrow the grant the helper requests (`exchange.go` POSTs `access_tokens` with a
+  **nil body**, so git receives all seven installation permissions including write when it needs
+  repo read/write on one repo); the narrowing machinery already exists from `#3647`.
 - ⛔ **`hardening_compilefail_test.go` is a TDD fossil, and its header is a lie.** It says the
   package "will not compile until Forge implements them" — all three functions exist, and its four
   tests are ordinary tests that pass under a plain `go test ./...`. There is no build tag anywhere
@@ -323,6 +368,11 @@ Stated at `main.go:18-31`. Each names what breaking it costs.
 - ⚠ **A new repo may also need adding to the GitHub App installation.** The org installation
   measured `repository_selection: all` on 2026-08-21; `#1880` recorded personal-account installs
   as select-repos, and that one returns 403 without App-authorized auth — unverified.
+- **`#3673`** — narrow the credential-helper grant so `git` gets repo-scoped access instead of
+  the installation's full permissions. Filed 2026-09-20 off the `#3667` review; **deliberately
+  deferred, not deprioritised**, and it is the git-critical path, so it needs a spec and a real
+  acceptance run rather than a quick patch. The property it closes is the first per-repo gotcha
+  above. ⚠ Read the activity log on the task before starting — the full rationale is there.
 - **`#2651`, 2026-10-21** — review whether the `actions` permission can narrow to `read`. A date
   rather than a usage trigger, deliberately: non-use emits no signal, so a usage-based trigger
   would rot silently.

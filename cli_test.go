@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -356,21 +357,6 @@ func TestCLI_TokenSubcommand_MissingConfig_ExitsNonZero(t *testing.T) {
 	}
 }
 
-// TestCLI_TokenSubcommand_UnknownOwner_ExitsNonZero verifies that `sigil token`
-// fails closed when the owner is not in the installations map.
-func TestCLI_TokenSubcommand_UnknownOwner_ExitsNonZero(t *testing.T) {
-	// Given: a config with a known owner, but requesting a different one
-	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "known-owner"))
-
-	// When: sigil token is called for an unknown owner
-	result := runSigil(t, []string{"token", "unknown-owner"}, "", []string{"HOME=" + home})
-
-	// Then: exits non-zero (fail closed)
-	if result.exitCode == 0 {
-		t.Errorf("expected non-zero exit for unknown owner in 'sigil token', got 0")
-	}
-}
-
 // --- sigil token --rate-limit-only argument polarity (#3647) ---
 //
 // These reject every disallowed shape BEFORE config load: HOME points at an
@@ -475,6 +461,170 @@ func TestCLI_TokenRateLimitOnly_AcceptedShape_ReachesConfigLoad(t *testing.T) {
 	}
 	if !strings.Contains(errBuf.String(), "open config") {
 		t.Errorf("stderr: got %q, want it to show a config-load failure (proves the well-formed shape was accepted by argument parsing)", errBuf.String())
+	}
+}
+
+// --- #3667: `sigil token <owner>` refuses a non-terminal stdout ---
+//
+// These tests pin WHICH path is gated, which is the whole risk of the change.
+// Every one of them runs with stdout captured through a pipe (what runSigil and
+// exec.Command do), i.e. exactly the non-tty condition the gate fires on.
+//
+// The ordering proof is the identity of the error, the same technique the
+// --rate-limit-only tests above use with "open config": each test below runs
+// with a VALID config and with OP_SERVICE_ACCOUNT_TOKEN stripped, so
+//
+//	stderr says "OP_SERVICE_ACCOUNT_TOKEN"  ⇒ the run reached readKey — NOT gated
+//	stderr says "stdout is not a terminal"  ⇒ the run was refused before readKey
+//
+// and the two are mutually exclusive. No network assertion is needed for AC#2:
+// the access_tokens POST is strictly downstream of readKey in cmdToken's
+// straight-line code, and readKey demonstrably did not run.
+
+// stdoutNotATerminalMarker is the distinctive fragment of the refusal message.
+// Hardcoded rather than imported: cli_test.go is package main_test and a Go main
+// package cannot be imported, so every expectation here is black-box by
+// construction.
+const stdoutNotATerminalMarker = "stdout is not a terminal"
+
+// runSigilWithEnv executes the sigil binary with an EXACT environment rather
+// than one appended to the test process's own, so a test can strip
+// OP_SERVICE_ACCOUNT_TOKEN and behave the same on a developer machine where it
+// is set as on one where it is not.
+func runSigilWithEnv(t *testing.T, args []string, stdin string, env []string) runResult {
+	t.Helper()
+	cmd := exec.Command(binaryPath, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	cmd.Env = env
+
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	code := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("exec.Command(%v) failed unexpectedly: %v", args, err)
+		}
+	}
+	return runResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: code}
+}
+
+// envForGateTest returns an environment with a valid config at HOME and
+// OP_SERVICE_ACCOUNT_TOKEN removed.
+func envForGateTest(t *testing.T) []string {
+	t.Helper()
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "myorg"))
+	env := envWithout("OP_SERVICE_ACCOUNT_TOKEN")
+	return append(env, "HOME="+home)
+}
+
+// TestCLI_TokenFullForm_NonTerminalStdout_Refuses covers AC#1, AC#2 and AC#3:
+// the full-permission form with stdout on a pipe exits non-zero, prints nothing
+// to stdout, names the reason, and is refused BEFORE the 1Password key read
+// (hence before any network call).
+func TestCLI_TokenFullForm_NonTerminalStdout_Refuses(t *testing.T) {
+	result := runSigilWithEnv(t, []string{"token", "myorg"}, "", envForGateTest(t))
+
+	if result.exitCode == 0 {
+		t.Errorf("exit code: got 0, want non-zero for `token myorg` with stdout on a pipe")
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout: got %q, want empty — a refused run prints no token", result.stdout)
+	}
+	if !strings.Contains(result.stderr, stdoutNotATerminalMarker) {
+		t.Errorf("stderr: got %q, want it to name the reason (%q)", result.stderr, stdoutNotATerminalMarker)
+	}
+	// Ordering: if the gate ran after readKey, this is the error we would see
+	// instead, because the environment has no service-account token.
+	if strings.Contains(result.stderr, "OP_SERVICE_ACCOUNT_TOKEN") {
+		t.Errorf("stderr shows the key read was attempted on a refused run: %s", result.stderr)
+	}
+}
+
+// TestCLI_TokenFullForm_TerminalStdout_ReachesKeyRead is the CLI-level positive
+// control: under an allocated pty the SAME binary proceeds past the gate to the
+// key read. Without it, a gate that refused unconditionally — or a binary that
+// failed early for an unrelated reason — would satisfy every refusal assertion
+// above.
+//
+// `script -q /dev/null <cmd>` is how the pty is allocated; it was measured on
+// 2026-09-20 to report a terminal, and to keep reporting one when its own output
+// is piped onward. That second measurement is also why the gate is documented as
+// a speed bump: this test is simultaneously the positive control and the
+// demonstrated bypass.
+//
+// macOS-only: BSD and GNU `script` take their command argument differently, and
+// this repo is built and run on macOS.
+func TestCLI_TokenFullForm_TerminalStdout_ReachesKeyRead(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("pty control uses BSD `script` argument form; GOOS=%s", runtime.GOOS)
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skipf("`script` not available (%v) — cannot allocate a pty", err)
+	}
+
+	cmd := exec.Command("script", "-q", "/dev/null", binaryPath, "token", "myorg")
+	cmd.Env = envForGateTest(t)
+	// script merges the child's stdout and stderr onto the pty, so both arrive
+	// here as one stream.
+	out, _ := cmd.CombinedOutput()
+
+	if strings.Contains(string(out), stdoutNotATerminalMarker) {
+		t.Errorf("output: got %q, want no refusal — a pty must be permitted", string(out))
+	}
+	if !strings.Contains(string(out), "OP_SERVICE_ACCOUNT_TOKEN") {
+		t.Errorf("output: got %q, want the key-read failure, which is the proof the run got past the gate", string(out))
+	}
+}
+
+// TestCLI_TokenRateLimitOnly_NonTerminalStdout_Unaffected covers AC#4: the
+// narrowed form is the sanctioned unattended path and must be completely
+// unaffected by stdout being a pipe. It reaches the key read, so it was not
+// gated.
+//
+// This is a distinct test from TestCLI_TokenRateLimitOnly_AcceptedShape_ReachesConfigLoad
+// above, which uses an EMPTY home and so would stop at config load before a
+// leaked gate could fire — it cannot catch this regression.
+func TestCLI_TokenRateLimitOnly_NonTerminalStdout_Unaffected(t *testing.T) {
+	result := runSigilWithEnv(t, []string{"token", "--rate-limit-only", "myorg/myrepo"}, "", envForGateTest(t))
+
+	if strings.Contains(result.stderr, stdoutNotATerminalMarker) {
+		t.Errorf("stderr: got %q, want no refusal — --rate-limit-only must not be gated", result.stderr)
+	}
+	if !strings.Contains(result.stderr, "OP_SERVICE_ACCOUNT_TOKEN") {
+		t.Errorf("stderr: got %q, want the key-read failure, which proves the run got past every preflight check", result.stderr)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout: got %q, want empty", result.stdout)
+	}
+}
+
+// TestCLI_HelperGet_NonTerminalStdout_Unaffected covers AC#5, the catastrophic
+// failure mode: git drives `sigil get` over pipes on every invocation, so a gate
+// reaching that handler — directly or through a shared helper — breaks every git
+// operation on every wired repository, silently from git's point of view.
+//
+// A GitHub HTTPS request with stdout on a pipe must run the ordinary path all
+// the way to the key read.
+func TestCLI_HelperGet_NonTerminalStdout_Unaffected(t *testing.T) {
+	stdin := "protocol=https\nhost=github.com\npath=myorg/repo\n\n"
+
+	result := runSigilWithEnv(t, []string{"get"}, stdin, envForGateTest(t))
+
+	if strings.Contains(result.stderr, stdoutNotATerminalMarker) {
+		t.Errorf("stderr: got %q — the credential-helper path MUST NOT be gated on a terminal", result.stderr)
+	}
+	if !strings.Contains(result.stderr, "OP_SERVICE_ACCOUNT_TOKEN") {
+		t.Errorf("stderr: got %q, want the key-read failure, which proves `get` ran its ordinary path under a pipe", result.stderr)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout: got %q, want empty (no token available in this environment)", result.stdout)
 	}
 }
 
