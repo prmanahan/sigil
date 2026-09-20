@@ -3,11 +3,17 @@ package main
 // main.go — Sigil CLI dispatcher: git credential helper + utility subcommands.
 //
 // Subcommands:
-//   sigil (bare) / sigil get   — git credential helper mode (reads stdin key=value)
-//   sigil store                — no-op (git protocol requirement), exit 0
-//   sigil erase                — no-op (git protocol requirement), exit 0
-//   sigil token <owner>        — mint and print installation token to stdout
-//   sigil doctor               — verify config + key + one mint; print safe summary
+//   sigil (bare) / sigil get               — git credential helper mode (reads stdin key=value)
+//   sigil store                             — no-op (git protocol requirement), exit 0
+//   sigil erase                             — no-op (git protocol requirement), exit 0
+//   sigil token <owner>                     — mint and print a full-permission installation
+//                                              token to stdout (cached; unchanged since #1880)
+//   sigil token --rate-limit-only <owner>/<repo>
+//                                            — mint and print a token narrowed to
+//                                              metadata:read on exactly one repo; verified
+//                                              against GitHub's actual grant before being
+//                                              trusted or printed; never cached (#3647)
+//   sigil doctor                            — verify config + key + one mint; print safe summary
 //
 // Security invariants:
 //   - Private key: never written to disk; read in-process from 1Password.
@@ -15,6 +21,14 @@ package main
 //   - SA token: read from env only; never logged or persisted.
 //   - All error paths exit non-zero with a message to stderr; no key/token material
 //     appears in any error message.
+//   - Rate-limit-only token (--rate-limit-only): the access_tokens request body is fixed
+//     in code — {"metadata":"read"} on exactly one repo, never built from unvalidated
+//     input. GitHub's actual grant (permissions, repository_selection, repositories) is
+//     verified against that exact request before the token is trusted or printed; any
+//     mismatch revokes the token and returns an error instead. Never cached: it is a
+//     one-shot credential, not a long-lived one. ⇒ Breaking the verification lets a
+//     silently-widened grant (e.g. an empty permissions object granting everything,
+//     write included — measured #3647) reach stdout unnoticed.
 
 import (
 	"bufio"
@@ -56,10 +70,7 @@ func run(args []string) error {
 		// silently with exit 0.
 		return nil
 	case "token":
-		if len(args) < 2 {
-			return errors.New("usage: sigil token <owner>")
-		}
-		return cmdToken(args[1])
+		return dispatchToken(args[1:])
 	case "doctor":
 		return cmdDoctor()
 	default:
@@ -144,6 +155,103 @@ func cmdToken(owner string) error {
 	defer cancel()
 
 	token, err := getInstallationToken(ctx, cfg, key, owner, apiBase(), cacheDir)
+	if err != nil {
+		return err
+	}
+
+	// Token to stdout is sanctioned for this subcommand.
+	fmt.Println(token)
+	return nil
+}
+
+// rateLimitOnlyFlag selects the narrowed form of `sigil token`. Checked by exact
+// string equality only — see dispatchToken for why a substring or prefix match
+// is not used.
+const rateLimitOnlyFlag = "--rate-limit-only"
+
+// dispatchToken enumerates the exactly two permitted shapes of `sigil token` and
+// rejects everything else — before any config load, key read, or network call.
+// args is everything after the "token" subcommand word itself.
+//
+//	token <owner-or-path>                    (1 arg)  — unchanged, delegates to cmdToken
+//	token --rate-limit-only <owner>/<repo>   (2 args)  — delegates to cmdTokenNarrowed
+//
+// ⛔ This enumerates the permitted forms rather than scanning args for the flag
+// and taking the last element: that shape would let a typo'd or misplaced flag
+// (e.g. --rate-limt-only, or the flag placed after the positional) silently fall
+// through to a full-permission mint — the same class of silent widening
+// verifyNarrowedGrant guards against on GitHub's side (#3647: an empty
+// permissions object in the request was granted every installation
+// permission, write included), moved into this parser instead.
+func dispatchToken(args []string) error {
+	const usage = "usage: sigil token <owner> | sigil token --rate-limit-only <owner>/<repo>"
+
+	switch len(args) {
+	case 1:
+		if args[0] == rateLimitOnlyFlag {
+			return fmt.Errorf("%s (missing <owner>/<repo>)", usage)
+		}
+		// The flag takes a separate positional, never --rate-limit-only=value —
+		// reject the equals-form explicitly rather than letting it fall through
+		// to cmdToken as a literal (and harmless-but-wrong) owner name.
+		if strings.HasPrefix(args[0], rateLimitOnlyFlag+"=") {
+			return fmt.Errorf("%s (--rate-limit-only takes a separate <owner>/<repo> argument, not %s=value)", usage, rateLimitOnlyFlag)
+		}
+		return cmdToken(args[0])
+	case 2:
+		if args[0] != rateLimitOnlyFlag {
+			return errors.New(usage)
+		}
+		owner, repo, err := parseOwnerRepo(args[1])
+		if err != nil {
+			return fmt.Errorf("%s: %w", usage, err)
+		}
+		return cmdTokenNarrowed(owner, repo)
+	default:
+		return errors.New(usage)
+	}
+}
+
+// parseOwnerRepo splits "<owner>/<repo>" strictly: exactly one slash, both sides
+// non-empty. Anything else (a/b/c, /repo, owner/, no slash at all) is rejected
+// here, before the value reaches config load or any network call.
+func parseOwnerRepo(s string) (owner, repo string, err error) {
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("expected exactly one %q in <owner>/<repo>, got %q", "/", s)
+	}
+	owner, repo = parts[0], parts[1]
+	if owner == "" || repo == "" {
+		return "", "", fmt.Errorf("<owner>/<repo> must have non-empty owner and repo, got %q", s)
+	}
+	return owner, repo, nil
+}
+
+// cmdTokenNarrowed mints and prints a rate-limit-only installation token for
+// owner/repo to stdout. The token is verified against GitHub's actual grant
+// before being trusted or printed (see getRateLimitOnlyToken); never cached.
+func cmdTokenNarrowed(owner, repo string) error {
+	cfg, err := loadConfigDefault()
+	if err != nil {
+		return err
+	}
+
+	// L1: validate API base URL scheme before any credential read (fail closed,
+	// no credentials required to detect a misconfiguration).
+	if err := validateAPIBase(apiBase()); err != nil {
+		return err
+	}
+
+	key, err := readKey(cfg.OPKeyRef)
+	if err != nil {
+		return err
+	}
+
+	// M1: bounded context prevents an unbounded hang on an unresponsive API.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	token, err := getRateLimitOnlyToken(ctx, cfg, key, owner, repo, apiBase())
 	if err != nil {
 		return err
 	}

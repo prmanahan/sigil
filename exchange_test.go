@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -152,6 +153,41 @@ func TestExchangeInstallationToken_401ReturnsErrUnauthorizedSentinel(t *testing.
 	// And: the specific sentinel is in the chain (not just any error).
 	if !errors.Is(err, errUnauthorized) {
 		t.Errorf("expected errors.Is(err, errUnauthorized); got: %v", err)
+	}
+}
+
+// TestExchangeInstallationToken_SendsEmptyBody verifies #3647's "git path
+// unchanged" requirement: exchangeInstallationToken (used by both cmdGet and
+// the plain `sigil token <owner>` form) still sends a nil/empty body — the
+// narrowed --rate-limit-only path is a sibling (token_narrow.go), not a
+// modification of this function.
+func TestExchangeInstallationToken_SendsEmptyBody(t *testing.T) {
+	// Given: a mock server that captures the raw request body
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(githubInstallationResponse{
+			Token:     "tok",
+			ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+	}))
+	defer srv.Close()
+
+	// When: exchangeInstallationToken is called (the git-credential-helper path)
+	_, _, err := exchangeInstallationToken(context.Background(), srv.URL, "test.jwt", 12345)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Then: the request body is empty — no permissions/repositories narrowing
+	if len(gotBody) != 0 {
+		t.Errorf("request body: got %d bytes (%q), want empty (nil body, full-permission mint)", len(gotBody), gotBody)
 	}
 }
 

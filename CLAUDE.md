@@ -19,13 +19,14 @@ Flat `package main` at the repo root. No `cmd/`, no `internal/`, no subpackages.
 
 | File | Responsible for |
 |---|---|
-| `main.go` | CLI dispatch (`run()`), the `get` / `token` / `doctor` handlers, config + key loading, PEM parsing, credential-protocol I/O |
+| `main.go` | CLI dispatch (`run()`), the `get` / `token` / `doctor` handlers, `dispatchToken`'s argument-polarity parser, config + key loading, PEM parsing, credential-protocol I/O |
 | `config.go` | The three-field TOML config and its loader |
 | `routing.go` | `resolveInstallation` — repo owner → installation ID. Fail-closed, no default |
 | `jwt.go` | `mintAppJWT` — the RS256 App JWT. `now` is injected, for testability |
-| `exchange.go` | The App-JWT → installation-token HTTP exchange, and the `errUnauthorized` sentinel |
+| `exchange.go` | The App-JWT → installation-token HTTP exchange (nil body, full permissions), and the `errUnauthorized` sentinel |
 | `token.go` | The seven-step orchestrator; the only file that composes routing + cache + jwt + exchange |
-| `cache.go` | On-disk token cache, `0600`-enforced |
+| `token_narrow.go` | `sigil token --rate-limit-only`: the fixed-body (`{"permissions":{"metadata":"read"},"repositories":[repo]}`) access_tokens POST, `verifyNarrowedGrant`'s exact-match check against GitHub's actual response, and revoke-on-mismatch. Sibling to `token.go`/`exchange.go` — never imports `cache.go` (`#3647`) |
+| `cache.go` | On-disk token cache, `0600`-enforced. Only `token.go`'s full-permission path reads/writes it |
 | `justfile` | `build` · `test` · `vet` · `fmt` · `fmt-check` · `check`. ⚠ **No `install` recipe** |
 | `config.example.toml` | The template. Non-secret fields only; its comments carry the secret-boundary rationale |
 | `testdata/*.toml` | Three config fixtures: valid, malformed, and no-installations |
@@ -45,7 +46,13 @@ just check
 
 Chains `vet` → `fmt-check` → `test` (`go vet ./...`, `test -z "$(gofmt -l .)"`,
 `go test ./...`). **Measured 2026-08-21: all green, exit 0.** ~8 s cold, ~0.3 s warm. 63 tests
-pass, 2 skip.
+pass, 2 skip. **Re-measured 2026-09-17 after `#3647` (`--rate-limit-only`) landed: still
+green, exit 0, ~3.3 s cold. 77 top-level tests pass, 2 skip** — the 14 new top-level tests are
+`token_narrow.go`'s coverage (including the Warden-review follow-up: the 401-retry-still-verifies,
+empty-token, and revoke-survives-a-cancelled/expired-context tests) plus the CLI
+argument-polarity and empty-body tests; skip count is unchanged (still gated on
+`OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`, per the table
+below).
 
 **`check` has no `build` recipe and does not need one.** `cli_test.go`'s `TestMain` runs
 `go build` into a temp dir and panics on failure *before* any test executes, and Go compiles
@@ -188,7 +195,7 @@ from the remote. Peter: *"merge skill is fixable we own it, so not critical."*
 
 ## Security invariants — do not regress these
 
-Stated at `main.go:12-17`. Each names what breaking it costs.
+Stated at `main.go:18-31`. Each names what breaking it costs.
 
 - **The App private key never touches disk.** Resolved in-process from 1Password over the API,
   parsed from memory. ⇒ Breaking it puts the root credential that mints every token on disk;
@@ -209,6 +216,20 @@ Stated at `main.go:12-17`. Each names what breaking it costs.
 - **Error messages quote types, status codes and lengths — never bytes.**
 - **Cached expiry is GitHub's `expires_at` minus five minutes**, so a cache hit can never hand
   back a token within five minutes of death.
+- **A `--rate-limit-only` token is verified against GitHub's actual grant before it is trusted
+  or printed, and is never cached.** `token_narrow.go`'s `verifyNarrowedGrant` checks
+  `permissions`, `repository_selection` and `repositories` from the response — four conditions,
+  all ANDed, exact match — not from what was requested. Any mismatch revokes the token
+  (`DELETE /installation/token`) and returns an error instead. ⇒ Breaking the verification lets
+  a silently-widened grant reach stdout. **Measured by Peter, live run of
+  `live_narrow_probe_test.go`, 2026-09-17, mnemra installation `143101545`** (not independently
+  re-verified by Forge — Keychain access was denied to the implementing session, see `#3647`):
+  an access_tokens request body of `{"permissions":{}}` was granted **all seven** installation
+  permissions including write, not none; a request body of
+  `{"permissions":{"metadata":"read"},"repositories":[]}` was granted `repository_selection:
+  "all"`, not zero repositories. Both are exactly the class this verification exists to catch —
+  do not weaken `verifyNarrowedGrant` to a single `permissions["metadata"]=="read"` check, which
+  passes the first of these two silently.
 
 ## Per-repo gotchas
 

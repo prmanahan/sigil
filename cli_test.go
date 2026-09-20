@@ -14,6 +14,7 @@ package main_test
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -370,6 +371,113 @@ func TestCLI_TokenSubcommand_UnknownOwner_ExitsNonZero(t *testing.T) {
 	}
 }
 
+// --- sigil token --rate-limit-only argument polarity (#3647) ---
+//
+// These reject every disallowed shape BEFORE config load: HOME points at an
+// empty temp dir with no config file, so if dispatch fell through to
+// cmdToken/cmdTokenNarrowed, the error would be a "open config ...: no such
+// file" message (loadConfig's wording), which is distinguishable from the
+// "usage: ..." argument error. Asserting stderr does NOT contain "open config"
+// is the observable proof that rejection happened in argument parsing, not
+// downstream of it.
+
+// TestCLI_TokenRateLimitOnly_RejectedShapes_NoConfigLoad table-drives every
+// disallowed `sigil token` shape named in #3647: an unknown flag, a typo'd
+// flag, the flag placed after the positional, extra positionals (both the
+// plain and flag forms), a missing repo, and a malformed <owner>/<repo>
+// (two slashes, empty owner, empty repo).
+func TestCLI_TokenRateLimitOnly_RejectedShapes_NoConfigLoad(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "unknown flag", args: []string{"token", "--foo", "owner/repo"}},
+		{name: "typo'd flag", args: []string{"token", "--rate-limt-only", "owner/repo"}},
+		{name: "equals-form flag", args: []string{"token", "--rate-limit-only=owner/repo"}},
+		{name: "flag after positional", args: []string{"token", "owner/repo", "--rate-limit-only"}},
+		{name: "extra positional, plain form", args: []string{"token", "myorg", "extra"}},
+		{name: "extra positional, flag form", args: []string{"token", "--rate-limit-only", "owner/repo", "extra"}},
+		{name: "missing repo", args: []string{"token", "--rate-limit-only"}},
+		{name: "two slashes", args: []string{"token", "--rate-limit-only", "a/b/c"}},
+		{name: "empty owner", args: []string{"token", "--rate-limit-only", "/x"}},
+		{name: "empty repo", args: []string{"token", "--rate-limit-only", "x/"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given: an empty HOME — no config file at all
+			emptyHome := t.TempDir()
+			env := envWithout("OP_SERVICE_ACCOUNT_TOKEN")
+			env = append(env, "HOME="+emptyHome)
+
+			// When: sigil is invoked with the rejected argument shape
+			cmd := exec.Command(binaryPath, tc.args...)
+			cmd.Env = env
+			var outBuf, errBuf strings.Builder
+			cmd.Stdout = &outBuf
+			cmd.Stderr = &errBuf
+			runErr := cmd.Run()
+			exitCode := 0
+			if runErr != nil {
+				if exitErr, ok := runErr.(*exec.ExitError); ok {
+					exitCode = exitErr.ExitCode()
+				}
+			}
+
+			// Then: non-zero exit, empty stdout
+			if exitCode == 0 {
+				t.Errorf("exit code: got 0, want non-zero for args %v", tc.args)
+			}
+			if outBuf.String() != "" {
+				t.Errorf("stdout: got %q, want empty for args %v", outBuf.String(), tc.args)
+			}
+			// And: the error is the argument-polarity rejection, not a config-load
+			// failure — proving rejection happened before config load / key read /
+			// any network call.
+			if strings.Contains(errBuf.String(), "open config") {
+				t.Errorf("stderr shows config load was attempted for a rejected shape %v: %s", tc.args, errBuf.String())
+			}
+			if !strings.Contains(errBuf.String(), "usage") {
+				t.Errorf("stderr: got %q, want it to mention \"usage\" for args %v", errBuf.String(), tc.args)
+			}
+		})
+	}
+}
+
+// TestCLI_TokenRateLimitOnly_AcceptedShape_ReachesConfigLoad is the positive
+// control for the table above: a well-formed --rate-limit-only invocation
+// must NOT be rejected by argument parsing, and must reach (and fail at)
+// config load — proving the rejected-shapes test isn't green because
+// argument parsing rejects everything indiscriminately.
+func TestCLI_TokenRateLimitOnly_AcceptedShape_ReachesConfigLoad(t *testing.T) {
+	emptyHome := t.TempDir()
+	env := envWithout("OP_SERVICE_ACCOUNT_TOKEN")
+	env = append(env, "HOME="+emptyHome)
+
+	cmd := exec.Command(binaryPath, "token", "--rate-limit-only", "myorg/myrepo")
+	cmd.Env = env
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	exitCode := 0
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+
+	if exitCode == 0 {
+		t.Errorf("exit code: got 0, want non-zero (no config present)")
+	}
+	if outBuf.String() != "" {
+		t.Errorf("stdout: got %q, want empty", outBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "open config") {
+		t.Errorf("stderr: got %q, want it to show a config-load failure (proves the well-formed shape was accepted by argument parsing)", errBuf.String())
+	}
+}
+
 // --- sigil doctor subcommand ---
 
 // TestCLI_DoctorSubcommand_MissingConfig_ExitsNonZero verifies that `sigil doctor`
@@ -504,10 +612,14 @@ func TestCLI_LeakScan_NoPEMMarkersInOutput(t *testing.T) {
 	}
 }
 
-// TestCLI_LeakScan_TokenNotInStderr verifies that if a token is returned via the
-// sanctioned `password=` channel in stdout, the same token value does NOT appear
-// in stderr. This is the channel-separation invariant.
-// Requires 1Password credentials.
+// TestCLI_LeakScan_TokenNotInStderr verifies that if a token is returned via a
+// sanctioned stdout channel, the same token value does NOT appear in stderr.
+// This is the channel-separation invariant, checked at both of Sigil's
+// stdout-emission sites: `sigil get`'s `password=` line (writeCredentialResponse)
+// and `sigil token --rate-limit-only`'s fmt.Println (cmdTokenNarrowed, #3647
+// Warden finding #2 — this second site previously had no leak-scan coverage
+// at all). Requires 1Password credentials; stays gated on that exactly as
+// before — this does not run under `just check`.
 func TestCLI_LeakScan_TokenNotInStderr(t *testing.T) {
 	skipIfNoOPToken(t)
 
@@ -518,13 +630,28 @@ func TestCLI_LeakScan_TokenNotInStderr(t *testing.T) {
 
 	const installID = 12345
 	const issuedToken = "ghs_issued_token_for_leak_check"
+	const narrowedIssuedToken = "ghs_narrowed_issued_token_for_leak_check"
 
+	// The full-permission path (exchangeInstallationToken) sends a nil request
+	// body; the narrowed path (exchangeNarrowedToken) always sends a JSON
+	// body. Both hit the same access_tokens URL under this one mock server, so
+	// body presence is what distinguishes which response shape to return.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{
-			"token":      issuedToken,
-			"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		if len(body) == 0 {
+			json.NewEncoder(w).Encode(map[string]string{
+				"token":      issuedToken,
+				"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"token":                narrowedIssuedToken,
+			"permissions":          map[string]string{"metadata": "read"},
+			"repository_selection": "selected",
+			"repositories":         []map[string]any{{"name": "repo", "private": false}},
 		})
 	}))
 	defer srv.Close()
@@ -548,6 +675,29 @@ func TestCLI_LeakScan_TokenNotInStderr(t *testing.T) {
 	for _, marker := range []string{"BEGIN RSA PRIVATE KEY", "BEGIN PRIVATE KEY"} {
 		if strings.Contains(combined, marker) {
 			t.Errorf("PEM marker %q in output — key material leak", marker)
+		}
+	}
+
+	// --- second stdout-emission site: sigil token --rate-limit-only ---
+
+	narrowResult := runSigil(t, []string{"token", "--rate-limit-only", "leak-test-owner/repo"}, "", []string{
+		"HOME=" + home,
+		"SIGIL_GITHUB_API_URL=" + srv.URL,
+	})
+
+	// Positive control: the narrowed token must actually reach stdout, or the
+	// negative check below (absent from stderr) would be vacuously true.
+	if !strings.Contains(narrowResult.stdout, narrowedIssuedToken) {
+		t.Fatalf("narrowed token never reached stdout — positive control failed\nstdout: %s\nstderr: %s", narrowResult.stdout, narrowResult.stderr)
+	}
+	if strings.Contains(narrowResult.stderr, narrowedIssuedToken) {
+		t.Errorf("narrowed token appeared in stderr — unsanctioned channel leak\nstderr: %s", narrowResult.stderr)
+	}
+
+	combinedNarrow := narrowResult.stdout + narrowResult.stderr
+	for _, marker := range []string{"BEGIN RSA PRIVATE KEY", "BEGIN PRIVATE KEY"} {
+		if strings.Contains(combinedNarrow, marker) {
+			t.Errorf("PEM marker %q in narrowed-path output — key material leak", marker)
 		}
 	}
 }
