@@ -141,6 +141,30 @@ private key, never key material), `app_id`, and an `[installations]` table mappi
 installation ID. Copy `config.example.toml` and fill it. ⚠ The live file is `0644`. It holds no
 secrets by design, but it does publish the App ID and installation IDs to any local user.
 
+⛔ **Adding an `[installations]` entry may silently widen what agents can mint — and nothing
+here will tell you.** The agent permission rules that keep the full-token command away from
+agents are understood to deny it by matching the owner name literally, which couples them to this
+table holding **exactly** `prmanahan` and `mnemra` (the owners are measured, 2026-09-20; the
+coupling is **INHERITED AND UNVERIFIED** — see below). If that is right, adding a third owner
+means `sigil-helper token <newowner>` matches no deny rule: an agent can mint a
+**full-permission, write-capable** token for that owner, and the first sign of it is the token,
+not an error. The narrow `--rate-limit-only` form is unaffected either way — it verifies its own
+grant and fails closed.
+
+⚠ **The coupling above has NOT been confirmed from this root, and the rules were not found where
+they were looked for.** Searched 2026-09-20: `~/.claude/settings.json`,
+`~/.claude/settings.local.json`, and both `.claude/settings*.json` under this repo — **no rule
+mentioning sigil or the narrow command exists on any of them.** The rules are believed to live in
+mnemra-core's own settings, which is a different repository and deliberately not read from here.
+⇒ Treat this as a hazard to check before adding an owner, not as a described mechanism, and
+re-derive it from mnemra-core rather than from this paragraph.
+
+⚠ **This is PROSE, not mechanism, and that is the durable point.** Nothing in this repo, in
+sigil, or in mnemra-core checks the coupling — an allowlist of tool names cannot express a
+constraint that lives in a command's *argument*. Whoever adds an owner here updates those rules
+in the same change, or the widening ships unremarked. ⇒ If a mechanism is ever built, it belongs
+on the rule side (deny by default, allow-list the narrow form), not here.
+
 ## Remotes — two of them, and which one you use matters
 
 ⛔ **This section states a REQUIREMENT, not the state of your clone.** Remotes and credential
