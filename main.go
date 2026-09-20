@@ -7,7 +7,9 @@ package main
 //   sigil store                             — no-op (git protocol requirement), exit 0
 //   sigil erase                             — no-op (git protocol requirement), exit 0
 //   sigil token <owner>                     — mint and print a full-permission installation
-//                                              token to stdout (cached; unchanged since #1880)
+//                                              token to stdout (cached; unchanged since #1880).
+//                                              Refuses to run when stdout is not a terminal
+//                                              (#3667) — see requireTerminalStdout
 //   sigil token --rate-limit-only <owner>/<repo>
 //                                            — mint and print a token narrowed to
 //                                              metadata:read on exactly one repo; verified
@@ -29,6 +31,13 @@ package main
 //     one-shot credential, not a long-lived one. ⇒ Breaking the verification lets a
 //     silently-widened grant (e.g. an empty permissions object granting everything,
 //     write included — measured #3647) reach stdout unnoticed.
+//   - Full-permission token (sigil token <owner>): refused when stdout is not a
+//     terminal, before the key read and before any network call (#3667). This is a
+//     speed bump and not a boundary — a pty defeats it, and `sigil get` plus the
+//     on-disk cache sit outside it entirely — so it narrows the ordinary
+//     unattended case and does not replace the agent permission rule. The honest
+//     limits are enumerated at requireTerminalStdout; do not restate them more
+//     strongly than they are written there.
 
 import (
 	"bufio"
@@ -137,6 +146,19 @@ func cmdToken(owner string) error {
 	// L1: validate API base URL scheme before any credential read (fail closed,
 	// no credentials required to detect a misconfiguration).
 	if err := validateAPIBase(apiBase()); err != nil {
+		return err
+	}
+
+	// #3667: this form mints a FULL-PERMISSION token, so it runs interactively
+	// only. The check sits in the credential-free preflight band — after the
+	// scheme check, before readKey — so a refused run reads no secret and makes
+	// no network call. Ordered after the scheme check deliberately: a
+	// misconfigured API base is an operator-facing defect that should surface
+	// whether or not stdout is a terminal.
+	//
+	// Only this path is gated. cmdGet is driven by git over pipes and is non-tty
+	// on every invocation; cmdTokenNarrowed is the sanctioned unattended form.
+	if err := requireTerminalStdout(os.Stdout); err != nil {
 		return err
 	}
 
@@ -429,6 +451,88 @@ func validateAPIBase(rawURL string) error {
 		}
 	}
 	return fmt.Errorf("API base URL %q: https scheme required (http:// loopback is allowed for testing)", rawURL)
+}
+
+// errStdoutNotTerminal is the refusal text for the full-permission token form.
+// It is a constant with no interpolation, and requireTerminalStdout runs before
+// the key read and before any network call — so there is no token, key or
+// response body in the process to quote even by accident (#3667 AC#3).
+const errStdoutNotTerminal = "stdout is not a terminal: `sigil token <owner>` mints a full-permission installation token and runs interactively only (unattended use: `sigil token --rate-limit-only <owner>/<repo>`)"
+
+// requireTerminalStdout permits f only when it is a character device, and
+// refuses everything else — pipes, regular files, sockets. Called from cmdToken
+// alone (#3667). No CONFIGURED bypass reaches this decision: no flag, no
+// environment variable, nothing in config. That is a claim about this function
+// and nothing wider — the control has the bypasses enumerated below, and none
+// of them go through it.
+//
+// ⛔ Do NOT call this from cmdGet or from anything cmdGet calls. Git drives the
+// credential helper over pipes, so that path is non-tty on every single
+// invocation; gating it breaks every git operation on every wired repository,
+// and breaks it silently from git's point of view.
+//
+// ⚠ Honest limit — this is a SPEED BUMP, NOT A BOUNDARY, and it does not remove
+// the need for the agent permission rule that keeps this command out of
+// unattended runs. Four ways a full-permission token still reaches a
+// non-interactive caller with this gate in place, deliberately NOT ranked —
+// the first one dominates the rest and no "cheapest gap" claim survives it:
+//
+//   - ⛔ `sigil get` is ITSELF an on-demand, non-tty, full-permission token
+//     printer, and is supposed to be. Fed `protocol=https`, `host=github.com`
+//     and `path=<owner>/<anything>` on stdin, it writes `password=<token>` to a
+//     pipe (cmdGet → writeCredentialResponse) — no pty, no prior git operation,
+//     no cache read, nothing this gate is anywhere near. resolveInstallation
+//     reads only the first path segment, so the repo half is arbitrary. #3667
+//     AC#5 mandates leaving it alone and it is the entire purpose of the binary,
+//     so this is neither a defect nor fixable here; #3673 is the filed follow-up
+//     to narrow the grant the helper requests. It is named because a reader who
+//     sees only the gate will otherwise take the control for more than it is.
+//   - ⛔ A full-permission token is already ON DISK. cmdGet calls
+//     getInstallationToken with the same cacheDir, so every ordinary git
+//     operation through the helper writes ~/.cache/sigil/<installID>.json —
+//     0600, owner-readable, live for up to ~55 minutes (cache.go; expiry is
+//     GitHub's minus five). Reading it needs no pty and no subcommand. This gate
+//     stops the full form from MINTING AND PRINTING a token on demand; it does
+//     not stop anything running as this user from reading one git just minted.
+//   - A pty walks straight through it, and one need not even be allocated.
+//     Allocating: `script -q /dev/null sigil token <owner> | cat` reports a
+//     terminal AND the output is still captured — the pty survives being piped
+//     onward. Not allocating: this user already owns live pty slaves attached to
+//     running shells (12 of them on 2026-09-20), so
+//     `sigil token <owner> > /dev/ttysNNN` is a bare redirect into one that
+//     already exists, and when that pane belongs to tmux the bytes come straight
+//     back out with `tmux capture-pane -p`. Both measured 2026-09-20 on macOS,
+//     the second end-to-end against a live pane. ⚠ NNN is whatever tmux
+//     allocated that run (ttys012 on the day); it is not a fixed path, so do not
+//     read the device number as the property — "a pty this user already owns" is.
+//   - The character-device test is coarser than isatty(3): `/dev/null` is a
+//     character device, so `sigil token <owner> > /dev/null` is permitted where
+//     isatty(3) would refuse. ⚠ That run discards the PRINTED BYTES but NOT the
+//     token — the gate sits before the mint, and getInstallationToken calls
+//     cachePut (token.go) before cmdToken ever reaches fmt.Println, so the token
+//     lands in the cache file described two bullets up and is readable from
+//     there. `sigil token <owner> > /dev/null; cat ~/.cache/sigil/<id>.json` is
+//     a working bypass needing no pty at all. Stdlib-only is why the check is
+//     coarse: an exact isatty needs an ioctl and a dependency this repo does not
+//     carry.
+//
+// What it does buy, and the whole reason it is here: the ordinary unattended
+// invocation — a pipe, a captured file, an agent shell — fails loudly and
+// immediately, before any secret is read. A loud failure in the accidental case,
+// not prevention of a determined one.
+//
+// Fails closed: an f whose mode cannot be read is refused, not permitted.
+func requireTerminalStdout(f *os.File) error {
+	info, err := f.Stat()
+	if err != nil {
+		// Cannot evaluate ⇒ deny. The Stat error is an fs.PathError (a path and
+		// an errno); nothing secret exists in the process at this point.
+		return fmt.Errorf("%s [stdout mode unreadable: %v]", errStdoutNotTerminal, err)
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return errors.New(errStdoutNotTerminal)
+	}
+	return nil
 }
 
 // writeCredentialResponse writes the git credential helper response lines to w.
