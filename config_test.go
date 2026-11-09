@@ -1,10 +1,8 @@
 package main
 
-// AC#1: Config: valid TOML parses to the struct; missing/malformed → clear error + non-zero exit.
+// Config: valid TOML parses to the struct; missing/malformed → clear error + non-zero exit.
 //
-// These are white-box unit tests. They call loadConfig and inspect the Config struct
-// Forge will implement. Until Forge adds loadConfig and Config, this file does not compile —
-// that is the expected red state.
+// These are white-box unit tests. They call loadConfig and inspect the Config struct.
 
 import (
 	"strings"
@@ -89,9 +87,10 @@ func TestLoadConfig_NoInstallationsSection(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_ConfigHoldsNoSecrets verifies that the config struct fields do not
-// include fields that would hold secret material (the private key, SA token).
-// This is a compile-time structural check enforcing the "config holds no secrets" invariant.
+// TestLoadConfig_ConfigHoldsNoSecrets checks, on a loaded fixture, that the
+// config carries an op:// key reference and not key material. It inspects the
+// loaded values only; it does not inspect the struct's field set, so a new
+// secret-holding field would not fail it.
 func TestLoadConfig_ConfigHoldsNoSecrets(t *testing.T) {
 	// Given: a loaded config
 	cfg, err := loadConfig("testdata/config_valid.toml")

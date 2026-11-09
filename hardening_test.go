@@ -1,16 +1,8 @@
 package main
 
-// hardening_test.go — red-phase hardening tests (Warden M1, L2, L4).
-//
-// N2 and N3 findings are appended to their respective existing test files.
-// L1 is in cli_test.go (package main_test, black-box).
-// AC#7 (writeCredentialResponse) and L3 (defaultCacheDir / ensureCacheDir with
-// explicit dir arg) live in hardening_compilefail_test.go — they reference
-// not-yet-extracted functions and produce compile-fail red on purpose.
-//
-// Sequencing: this file contains only runtime tests so the package compiles for the
-// first evidence run. Compile-fail tests are isolated so we can capture per-finding
-// evidence in two separate `go test` runs.
+// hardening_test.go — hardening tests: request deadlines, cache file and
+// directory permissions, and corrupt-cache recovery. The writeCredentialResponse
+// and ensureCacheDir tests live in hardening_compilefail_test.go.
 
 import (
 	"context"
@@ -24,22 +16,17 @@ import (
 	"time"
 )
 
-// --- M1: context deadline aborts unbounded API hang ---
+// --- context deadline aborts unbounded API hang ---
 
 // TestGetInstallationToken_ContextDeadlineAborts verifies that getInstallationToken
 // respects a short context deadline and returns an error rather than blocking
 // when the GitHub API is unresponsive.
 //
-// M1 status: GREEN with current implementation (exchange.go already uses
-// http.NewRequestWithContext so the context deadline propagates to the HTTP
-// transport). This test documents the correct behaviour and guards against
-// regression to a bare http.NewRequest.
-//
-// Remaining M1 gap: cmdGet and cmdToken (main.go:97, 125) both pass
-// context.Background() — an unbounded context. Forge must thread a bounded
-// context (or add an http.Client with Timeout) through the CLI entry points.
-// That gap is not testable here without real credentials; document in Forge's
-// brief.
+// exchange.go uses http.NewRequestWithContext, so the context deadline reaches
+// the HTTP transport; this test guards against regression to a bare
+// http.NewRequest. The CLI entry points (cmdGet, cmdToken, cmdTokenNarrowed)
+// each wrap their request in a bounded context; that wiring needs real
+// credentials to reach and is not covered here.
 func TestGetInstallationToken_ContextDeadlineAborts(t *testing.T) {
 	// Given: an API server whose handler sleeps longer than the test deadline.
 	const installID = int64(12345)
@@ -74,15 +61,16 @@ func TestGetInstallationToken_ContextDeadlineAborts(t *testing.T) {
 	}
 }
 
-// --- L2: cachePut re-enforces 0600 on a pre-existing file ---
+// --- cachePut re-enforces 0600 on a pre-existing file ---
 
 // TestCachePut_ReenforcesPermsOnExistingFile verifies that cachePut tightens
 // the cache file to 0600 even when the file already exists with looser permissions.
 //
-// RED: os.WriteFile opens an existing file with O_CREAT|O_TRUNC; the perm
-// argument is ignored by the kernel when the file already exists (POSIX: mode
-// only applies at creation). The existing 0644 mode is preserved. Forge must
-// add an explicit os.Chmod(path, 0600) after WriteFile.
+// os.WriteFile opens an existing file with O_CREAT|O_TRUNC, and the perm
+// argument is ignored when the file already exists (POSIX: mode only applies
+// at creation), so a pre-existing 0644 mode would be preserved. cachePut
+// therefore calls an explicit os.Chmod(path, 0600) after the write; this test
+// fails if that call is removed.
 func TestCachePut_ReenforcesPermsOnExistingFile(t *testing.T) {
 	// Given: a pre-existing cache file with mode 0644 (too permissive).
 	dir := t.TempDir()
@@ -114,14 +102,13 @@ func TestCachePut_ReenforcesPermsOnExistingFile(t *testing.T) {
 	}
 }
 
-// --- L4: corrupt cache file → re-mint, not hard-fail ---
+// --- corrupt cache file → re-mint, not hard-fail ---
 
 // TestCacheGet_CorruptFileIsMiss verifies that a cache file containing invalid JSON
 // is treated as a cache miss — (nil, nil) — rather than returning an unmarshal error.
 //
-// RED: current cacheGet returns (nil, fmt.Errorf("cacheGet: unmarshal ...")) on
-// JSON decode failure. Forge must change that path to return (nil, nil) so the
-// caller re-mints instead of failing closed on corrupt data.
+// cacheGet returns (nil, nil) on a JSON decode failure so the caller re-mints
+// instead of failing on corrupt data.
 func TestCacheGet_CorruptFileIsMiss(t *testing.T) {
 	// Given: a corrupt (non-JSON) cache file for installID 12345.
 	cacheDir := t.TempDir()
@@ -144,12 +131,12 @@ func TestCacheGet_CorruptFileIsMiss(t *testing.T) {
 }
 
 // TestGetInstallationToken_CorruptCacheRemints verifies the end-to-end effect:
-// a corrupt cache file causes getInstallationToken to re-mint via the API and
-// return a fresh token, not an error.
+// a corrupt cache file causes getInstallationTokenLazy (via the test-only
+// getInstallationToken wrapper) to re-mint via the API and return a fresh
+// token, not an error.
 //
-// RED: current getInstallationToken propagates the cacheGet unmarshal error as
-// "getInstallationToken: cache read: ...". After Forge changes cacheGet to return
-// (nil, nil) on corrupt data, this test becomes green.
+// A cacheGet unmarshal error propagated as "getInstallationTokenLazy: cache
+// read: ..." would fail this test.
 func TestGetInstallationToken_CorruptCacheRemints(t *testing.T) {
 	// Given: a corrupt cache file and a working mock API.
 	const installID = int64(12345)

@@ -1,24 +1,15 @@
 package main
 
-// AC#4 (re-mint path) + AC#6 (cache reuse) at the getInstallationToken level.
+// Re-mint path and cache reuse, at the getInstallationTokenLazy level (via the
+// test-only getInstallationToken wrapper below, which supplies an already-loaded
+// key).
 //
-// getInstallationToken is the high-level orchestrator:
+// The orchestrator:
 //   1. Check cache (cacheGet) — return cached token if valid.
 //   2. Mint App JWT (mintAppJWT).
 //   3. Exchange for installation token (exchangeInstallationToken).
 //   4. On 401 error: re-mint a fresh JWT and retry the exchange once.
 //   5. Write the new token to cache (cachePut).
-//
-// Signature (Forge must implement this exactly):
-//
-//	func getInstallationToken(
-//	    ctx context.Context,
-//	    cfg *Config,
-//	    key *rsa.PrivateKey,
-//	    repoPath string,
-//	    apiBaseURL string,
-//	    cacheDir string,
-//	) (string, error)
 
 import (
 	"context"
@@ -30,6 +21,20 @@ import (
 	"testing"
 	"time"
 )
+
+// getInstallationToken is getInstallationTokenLazy with an already-loaded key.
+// Test-only: production code reaches the key through the lazy form so that a
+// cache hit or an unknown owner never reads it.
+func getInstallationToken(
+	ctx context.Context,
+	cfg *Config,
+	key *rsa.PrivateKey,
+	repoPath string,
+	apiBaseURL string,
+	cacheDir string,
+) (string, error) {
+	return getInstallationTokenLazy(ctx, cfg, func(context.Context) (*rsa.PrivateKey, error) { return key, nil }, repoPath, apiBaseURL, cacheDir)
+}
 
 // newTestConfig returns a minimal Config for use in integration-style unit tests.
 func newTestConfig(installID int64) *Config {
@@ -91,7 +96,7 @@ func TestGetInstallationToken_FreshMintAndCache(t *testing.T) {
 	}
 }
 
-// TestGetInstallationToken_CacheHitSkipsAPI verifies AC#6:
+// TestGetInstallationToken_CacheHitSkipsAPI verifies cache reuse:
 // if the cache has a valid, non-expired token for the installation, the API is
 // NOT called again (no second mint — assert via mock server request count).
 func TestGetInstallationToken_CacheHitSkipsAPI(t *testing.T) {
@@ -139,7 +144,7 @@ func TestGetInstallationToken_CacheHitSkipsAPI(t *testing.T) {
 	}
 }
 
-// TestGetInstallationToken_ExpiredCacheRemints verifies AC#6 (expired → re-mint):
+// TestGetInstallationToken_ExpiredCacheRemints verifies expired → re-mint:
 // if the cached token is expired, the API is called to mint a fresh one.
 func TestGetInstallationToken_ExpiredCacheRemints(t *testing.T) {
 	// Given: a cache with an expired token
@@ -173,7 +178,7 @@ func TestGetInstallationToken_ExpiredCacheRemints(t *testing.T) {
 	}
 }
 
-// TestGetInstallationToken_401TriggersRemint verifies AC#4:
+// TestGetInstallationToken_401TriggersRemint verifies the 401 re-mint:
 // when GitHub returns 401 (JWT rejected), getInstallationToken re-mints a fresh
 // JWT and retries the exchange exactly once.
 func TestGetInstallationToken_401TriggersRemint(t *testing.T) {
@@ -316,5 +321,48 @@ func TestGetInstallationToken_ResultIsCached(t *testing.T) {
 	// And: the API was called exactly once (second call hit the cache)
 	if apiCallCount != 1 {
 		t.Errorf("API call count: got %d, want 1 (second call should hit cache)", apiCallCount)
+	}
+}
+
+// TestGetInstallationToken_401RetryUsesFreshlyMintedJWT pins that the retry's
+// JWT is minted anew, not reused. mintAppJWT's claims are in Unix seconds and
+// RS256 here is deterministic, so two JWTs minted in the same second are
+// byte-identical; the handler therefore holds the first 401 until the wall-clock
+// second has advanced, which makes the second mint differ with no clock seam.
+// Costs up to about one second.
+func TestGetInstallationToken_401RetryUsesFreshlyMintedJWT(t *testing.T) {
+	const installID = int64(12345)
+
+	cfg := newTestConfig(installID)
+	key := newTestKey(t)
+
+	var auths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		if len(auths) == 1 {
+			entry := time.Now().Unix()
+			for time.Now().Unix() <= entry {
+				time.Sleep(10 * time.Millisecond)
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{
+			"token":      "ghs_after_fresh_remint",
+			"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+	}))
+	defer srv.Close()
+
+	if _, err := getInstallationToken(context.Background(), cfg, key, "test-owner/repo", srv.URL, t.TempDir()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("API calls: got %d, want 2", len(auths))
+	}
+	if auths[0] == auths[1] {
+		t.Error("the retry reused the first JWT; it must be minted anew")
 	}
 }

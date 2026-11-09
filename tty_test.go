@@ -3,7 +3,7 @@ package main
 // tty_test.go — unit coverage for requireTerminalStdout (defined in main.go
 // beside validateAPIBase, its sibling credential-free preflight check).
 //
-// #3667: `sigil token <owner>` mints a full-permission token and must refuse to
+// `sigil token <owner>` mints a full-permission token and must refuse to
 // run when stdout is not a terminal. These tests exercise the decision function
 // directly; the wired-up binary is covered black-box in cli_test.go, including
 // the two paths that MUST NOT be gated (`sigil get`, `token --rate-limit-only`).
@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// TestRequireTerminalStdout_RefusesNonTerminals covers AC#1's decision half: a
+// TestRequireTerminalStdout_RefusesNonTerminals covers the decision half: a
 // pipe (what os/exec hands a child whose output is captured), and a regular
 // file (what an agent shell's redirected stdout is — measured 2026-09-20) are
 // both refused, with exactly the refusal message and nothing appended.
@@ -87,7 +87,7 @@ func TestRequireTerminalStdout_PermitsCharacterDevice(t *testing.T) {
 // This test asserts the weakness on purpose, so that it cannot change silently
 // in either direction. ⚠ Do NOT read the permitted /dev/null case as harmless:
 // the run discards the PRINTED BYTES but not the token. The gate sits before the
-// mint, and getInstallationToken calls cachePut before cmdToken reaches
+// mint, and getInstallationTokenLazy calls cachePut before cmdToken reaches
 // fmt.Println, so `sigil token <owner> > /dev/null` still leaves a live
 // full-permission token in ~/.cache/sigil/<installID>.json. See
 // requireTerminalStdout's comment for the full list of gaps. If this check is
@@ -128,7 +128,7 @@ func TestRequireTerminalStdout_FailsClosedOnUnreadableMode(t *testing.T) {
 	}
 }
 
-// TestErrStdoutNotTerminal_NamesReasonAndSanctionedAlternative covers AC#3: the
+// TestErrStdoutNotTerminal_NamesReasonAndSanctionedAlternative covers the refusal text: the
 // message names why the command refused, and points at the form that is meant
 // to be used unattended, so the refusal is actionable without inviting a bypass
 // (none is CONFIGURED — requireTerminalStdout enumerates the ones that exist

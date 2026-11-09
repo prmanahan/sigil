@@ -1,6 +1,6 @@
 package main
 
-// AC#3: JWT: valid RS256 with iss=app_id and iat/exp in bounds.
+// JWT: valid RS256 with iss=app_id and iat/exp in bounds.
 // Verify with the public key in-test (the RSA keypair is generated here).
 //
 // White-box unit tests for mintAppJWT. The keypair is generated in each test so
@@ -63,7 +63,7 @@ func TestMintAppJWT_SignatureVerifiesWithPublicKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintAppJWT failed: %v", err)
 	}
-	// And: the JWT verifies with the corresponding public key (AC#3)
+	// And: the JWT verifies with the corresponding public key
 	parseAndVerifyJWT(t, tokenStr, &key.PublicKey)
 }
 
@@ -225,9 +225,8 @@ func TestMintAppJWT_EXPIsAfterIAT(t *testing.T) {
 // TestMintAppJWT_WrongKeyFailsVerification verifies that a JWT minted with one RSA
 // key cannot be verified with a different key — basic tamper-resistance.
 //
-// N3b status: GREEN with current implementation. jwt.Parse with a wrong public key
-// always returns a signature-verification error. This test documents the property
-// and guards against a regression that disables signature checking.
+// jwt.Parse with a wrong public key always returns a signature-verification
+// error; this guards against a regression that disables signature checking.
 func TestMintAppJWT_WrongKeyFailsVerification(t *testing.T) {
 	// Given: two distinct RSA key pairs.
 	signingKey := generateTestKey(t)

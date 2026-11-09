@@ -1,6 +1,6 @@
 package main
 
-// AC#6 (cache layer): a second call within TTL reuses the cache (no second mint);
+// Cache layer: a second call within TTL reuses the cache (no second mint);
 // expired → re-mint; cache file perms are 0600.
 //
 // These tests cover the low-level cache primitives (cacheGet/cachePut).

@@ -1,17 +1,16 @@
 # sigil — project instructions
 
 A git credential helper that mints short-lived GitHub App installation tokens, so unattended
-agent runs reach GitHub without a human unlocking the 1Password desktop app. Built 2026-06-28
-under spec `#1880` and ADR `G-0016`; reviewed, shipped, and in daily use since.
+agent runs reach GitHub without a human unlocking the 1Password desktop app. Built 2026-06-28;
+reviewed, shipped, and in daily use since. Home: `github.com/prmanahan/sigil`. Licensed Apache-2.0
+(`LICENSE`).
 
-Brain project 35, repo 17. Single flat Go package, 16 files, ~3k lines. Two commits.
+Single flat Go package, 23 Go files, ~5.3k lines.
 
 ## Read this before treating anything here as settled
 
-This repo was onboarded into the new per-project workflow on **2026-08-21** — brain
-registration, this file, and the README all landed then. The code has not changed since
-June. ⚠ **Several in-code comments describe a state that no longer exists** (see gotchas) —
-where a comment and the code disagree, the code is right and the comment is a fossil.
+Where a comment and the code disagree, the code is right and the comment is a fossil. Most stale
+comments were reworded before publication, but none of this is machine-checked.
 
 ## Layout
 
@@ -25,11 +24,14 @@ Flat `package main` at the repo root. No `cmd/`, no `internal/`, no subpackages.
 | `jwt.go` | `mintAppJWT` — the RS256 App JWT. `now` is injected, for testability |
 | `exchange.go` | The App-JWT → installation-token HTTP exchange (nil body, full permissions), and the `errUnauthorized` sentinel |
 | `token.go` | The seven-step orchestrator; the only file that composes routing + cache + jwt + exchange |
-| `token_narrow.go` | `sigil token --rate-limit-only`: the fixed-body (`{"permissions":{"metadata":"read"},"repositories":[repo]}`) access_tokens POST, `verifyNarrowedGrant`'s exact-match check against GitHub's actual response, and revoke-on-mismatch. Sibling to `token.go`/`exchange.go` — never imports `cache.go` (`#3647`) |
+| `token_narrow.go` | `sigil token --rate-limit-only`: the fixed-body (`{"permissions":{"metadata":"read"},"repositories":[repo]}`) access_tokens POST, `verifyNarrowedGrant`'s exact-match check against GitHub's actual response, and revoke-on-mismatch. Sibling to `token.go`/`exchange.go` — never imports `cache.go` |
 | `cache.go` | On-disk token cache, `0600`-enforced. Only `token.go`'s full-permission path reads/writes it |
+| `*_test.go` | Tests. `credential_channel_test.go` pins the stdout/stderr channel separation of `writeCredentialResponse`; `parse_key_test.go` covers `parseRSAPrivateKey`; `lazy_key_test.go` and `cli_cache_test.go` pin the routing → cache → key-read order |
 | `justfile` | `build` · `test` · `vet` · `fmt` · `fmt-check` · `check`. ⚠ **No `install` recipe** |
 | `config.example.toml` | The template. Non-secret fields only; its comments carry the secret-boundary rationale |
 | `testdata/*.toml` | Three config fixtures: valid, malformed, and no-installations |
+| `LICENSE` | Apache-2.0, unmodified text, no NOTICE file |
+| `.gitleaksignore` | One entry: a known false positive on a test fixture string. Together with the inline `// gitleaks:allow` on the same fixture in `token_narrow_test.go`, it configures a secret scan (`gitleaks git` for history, `gitleaks dir` for the tree) that is **run by hand**; no hook, recipe or CI job runs it. Keep both; do not widen either |
 
 ⚠ **`unexported` buys nothing here.** One package, no import boundary — every identifier is
 reachable from every file. Invariants that read as "enclosed" are enclosed by *convention*.
@@ -45,28 +47,21 @@ just check
 ```
 
 Chains `vet` → `fmt-check` → `test` (`go vet ./...`, `test -z "$(gofmt -l .)"`,
-`go test ./...`). **Measured 2026-08-21: all green, exit 0.** ~8 s cold, ~0.3 s warm. 63 tests
-pass, 2 skip. **Re-measured 2026-09-17 after `#3647` (`--rate-limit-only`) landed: still
-green, exit 0, ~3.3 s cold. 77 top-level tests pass, 2 skip** — the 14 new top-level tests are
-`token_narrow.go`'s coverage (including the Warden-review follow-up: the 401-retry-still-verifies,
-empty-token, and revoke-survives-a-cancelled/expired-context tests) plus the CLI
-argument-polarity and empty-body tests; skip count is unchanged (still gated on
-`OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`, per the table
-below).
-
-**Re-measured 2026-09-20 after `#3667` (the `sigil token <owner>` TTY gate) and its
-Warden-review follow-up: still green, exit 0, ~3.7 s cold. 85 top-level tests pass, 2 skip, 0
-fail.** ⚠ **State the counting method, because it has already drifted once**: this number is
+`go test ./...`). **Measured 2026-11-09 after `go clean -testcache`: all green, exit 0, ~11 s
+cold. 110 top-level tests pass, 2 skip, 0 fail.**
+⚠ **State the counting method, because it has already drifted once**: this number is
 top-level only — `go test -count=1 -v ./...` then `grep -c '^--- PASS'` and `'^--- SKIP'`,
-which counts neither subtests nor `TestMain`. The tree holds 88 `func Test`; one is `TestMain`,
-leaving 87 top-level tests = 85 pass + 2 skip. The move from 77 is `#3667`'s **+9** (five
-`tty_test.go` unit tests on the gate, four `cli_test.go` black-box tests pinning *which* paths
-are gated) **−1** (the follow-up deleted `TestCLI_TokenSubcommand_UnknownOwner_ExitsNonZero`,
-whose name never described what it asserted — it always exited at the key read, never at
-routing). ⛔ **The skip count is unchanged at 2 and still gated on `OP_SERVICE_ACCOUNT_TOKEN` +
-`SIGIL_TEST_OP_KEY_REF`** — `#3667` added no skips and closed none of the gaps in the table
-below. ⚠ `just check` prints `(cached)` on a warm test cache; `go clean -testcache` first when
-the run itself is the evidence.
+which counts neither subtests nor `TestMain`. The tree holds 113 `func Test`; one is `TestMain`,
+leaving 112 top-level tests = 110 pass + 2 skip.
+⛔ **The skip count is 2 on macOS, gated on `OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`**,
+and the two skipped tests below remain the only coverage of the happy path and the end-to-end
+stderr leak scan. ⚠ **Those two are the only skips measured, and they are not the only ones
+possible.** Three more are platform-conditional and did not skip on macOS: the two CLI pty tests
+(`cli_test.go`, `cli_cache_test.go`) skip unless `GOOS` is darwin (they use the BSD `script`
+argument form) or when `script` is absent, and `tty_test.go` skips when `/dev/ptmx` cannot be
+opened. On another OS the skip count will be higher than 2 and the pty coverage will be absent;
+that has not been measured here. ⚠ `just check` prints `(cached)` on a warm test cache; `go clean
+-testcache` first when the run itself is the evidence.
 
 **`check` has no `build` recipe and does not need one.** `cli_test.go`'s `TestMain` runs
 `go build` into a temp dir and panics on failure *before* any test executes, and Go compiles
@@ -82,53 +77,80 @@ matter most:
 | Skipped test | What goes unchecked |
 |---|---|
 | `TestCLI_HelperGet_ValidGitHubPath` | The **entire end-to-end path**. A default run never proves the helper emits `username=` / `password=` at all |
-| `TestCLI_LeakScan_TokenNotInStderr` | The **only** test that checks a token does not reach stderr |
+| `TestCLI_LeakScan_TokenNotInStderr` | The **only** end-to-end check that a token does not reach stderr, across the whole binary (`get` and `token --rate-limit-only`). `writeCredentialResponse` alone is covered in the default gate — see below |
 
 Both are gated on real 1Password, not on network or GitHub — everything else mocks GitHub with
 `httptest`. Green here means *"the units are fine and nothing leaked a PEM"*, never *"it works."*
 
-⛔ **The false green — the one to know. Seeded and measured 2026-08-21.** `writeCredentialResponse`
-claims in-comment that it "has no code path to `os.Stderr`", and the test that supposedly proves it
-explicitly declines to check (*"No os.Stderr interception needed"*), asserting buffer contents only.
-The one test that would catch a token on stderr is the skip-gated one above. ⇒ **`fmt.Fprintln(os.Stderr,
-token)` was added inside `writeCredentialResponse` and `just check` returned exit 0, all tests `ok`.**
-The gate does not see a token written to stderr from the one function whose entire stated purpose is
-to make that impossible. The channel-separation invariant is carried by a function signature and a
-comment — convention, not mechanism.
+⛔ **The false green, narrowed but not closed.** `fmt.Fprintln(os.Stderr, token)` added inside
+`writeCredentialResponse` once left `just check` at exit 0, all tests `ok`: the in-comment claim
+that the function "has no code path to `os.Stderr`" was backed only by a test that declined to
+check. **Now:** `TestWriteCredentialResponse_TokenReachesOnlyTheGivenWriter`
+(`credential_channel_test.go`) swaps the `os.Stdout` and `os.Stderr` package variables for pipes
+(`captureStd`), calls the function, and fails if the token reaches either. The same seed was
+re-applied and the test failed on it (stderr contained the token); reverted, it passes.
+⚠ **The swap sees only writes made through those two variables.** A write to file descriptor 2
+directly (`syscall.Write`, a child process) never touches the variable and would pass. The
+black-box CLI test below runs the built binary and reads its real descriptors, so it does catch
+that, but only on the paths it drives.
+⚠ **What it covers, exactly:** that one function, `writeCredentialResponse`, in the default gate
+with no 1Password. A second default-gate check goes through the built binary:
+`TestCLI_Get_CacheHit_NoKeyRead_TokenOnStdoutOnly` (`cli_cache_test.go`) seeds a cache entry,
+runs `sigil get` with no service-account token, and asserts the token is on stdout and stderr is
+empty — so a token printed to stderr anywhere on **`sigil get`'s cache-hit path** (config load,
+routing, cache read, output) now fails the gate. **What it does NOT cover:** the cache-**miss**
+path — the mint, the 401 retry, `exchange.go`, error formatting after a key read — and
+`sigil token <owner>`'s and `--rate-limit-only`'s stderr (the pty test only checks the cached
+token appears; it does not assert stderr), and `doctor`. A `fmt.Fprintln(os.Stderr, token)` added
+on any of those still leaves `just check` green. The wider invariant ("the token leaves by exactly
+one channel") for those paths remains carried by the skip-gated `TestCLI_LeakScan_TokenNotInStderr`
+plus convention; it is **not** closed. Closing it needs an in-gate run of the built binary that
+reaches the mint path against a fake key and a mock API — which needs a non-test seam for the key
+source, deliberately not added.
 
-⚠ **`parseRSAPrivateKey` has zero test coverage** — measured by identifier count across all
-`*_test.go`. It is security-critical, it is the function behind the one production bug this repo
-has had (`#1892`, PEM newlines), and its PKCS#8 type assertion is exactly the branch that rots
-unnoticed. It is directly unit-testable: takes `[]byte`, returns `(*rsa.PrivateKey, error)`, no
-1Password needed, and `jwt_test.go` already generates keypairs in-process.
+⚠ **`parseRSAPrivateKey` is covered — `parse_key_test.go`, keys generated in-process.** It is
+security-critical and the function behind the one production bug this repo has had (PEM newlines
+stripped by a concealed 1Password field). Covered: valid PKCS#1; valid PKCS#8 RSA; PKCS#8 holding
+ECDSA and Ed25519 (error naming the type); no PEM block (empty, garbage); newline-stripped PEM for
+both encodings, with an intact-newlines control proving the stripping alone causes the failure; an
+unsupported block type (`EC PRIVATE KEY`); truncated DER in both arms. The key-material check
+(`assertNoKeyMaterial`) takes the DER bytes that actually reached the function (for the truncated
+case, the truncated bytes, not the full key) and tests three windows spread across them, each in
+raw, hex (either case), `%q`-escaped and base64 (standard and URL) form. **Seeded and measured:**
+removing the PKCS#8 type assertion (`rsaKey, _ := k.(*rsa.PrivateKey)`) made the non-RSA test
+fail (`expected an error for a non-RSA PKCS#8 key, got key <nil>`); quoting the input into the
+corrupt-DER error, once with `%q` and once with `%x`, made the truncated-DER test fail in both
+arms; each reverted, the tests pass. **Not covered:** the real 1Password round trip (the
+field-type landmine itself — a concealed field — only manifests there, and `readKey` needs real
+1Password, so only the skip-gated tests reach it); the key-material assertion is a windowed substring check, not a proof that no
+error path can ever quote bytes; the stdlib's own error text for corrupt DER is asserted not to
+leak, not pinned.
 
-⛔ **`semgrep` and `govulncheck` are NOT in `just check` and nothing re-runs them.** Both were
-run once, at the original Warden review (`#1880`), and CI was explicitly scoped out. One direct
+⛔ **`semgrep` and `govulncheck` are NOT in `just check` and nothing re-runs them.** `semgrep` was
+run once, at the original review, and CI was explicitly scoped out. `govulncheck` last ran clean
+(0 reachable vulnerabilities) on 2026-11-09, at Go directive 1.26.10. One direct
 dependency drags in a WASM runtime, a plugin framework and an OTLP/protobuf stack — that surface
 accrues advisories with nothing watching.
 
 ## Remote and merge posture (current, not aspirational)
 
-- **`prmanahan/sigil` on github.com** — private, default branch `main`. ⚠ **Which remote name
-  reaches it is a per-clone question** — see *Remotes*, below; a clone is expected to carry two.
-- ⛔ **Branch protection is not merely absent, it is UNAVAILABLE.** Measured 2026-08-21: the
-  protection and ruleset APIs both return **403 — "Upgrade to GitHub Pro or make this repository
-  public"**. `#2560` recorded sigil as "unprotected by decision"; more precisely, there is no
-  protection to configure at this plan and visibility. Same disposition as `mentat`.
+- **`github.com/prmanahan/sigil`** is the home; default branch `main`. ⚠ **Whether a clone's
+  `origin` is wired to reach it through Sigil is a per-clone question** — see *Remotes*, below.
+- ⛔ **No branch protection is configured here.** Nothing server-side stops a direct push to
+  `main` or a merge commit. Check the repository's current settings rather than assuming.
 - ⛔ **There is no `.github/` directory. A PR here runs NOTHING** — no workflow, no check, no
   server-side gate. A PR is a review surface, not a gate. ⇒ **A local `just check` is the entire
   verification layer, and it is the layer the actor being constrained can skip.** Do not let a
   green PR imply anything was verified.
-- **Land via PR** (Peter, 2026-08-21): squash to one delivery commit, push to `origin`, open the
-  PR, rebase-and-merge, then fast-forward local `main` **from the remote** — never advance it
-  locally. ⛔ **The `merge` skill cannot run here**: it treats more than one remote as a hard
-  stop, and this project requires two (`#3410`, filed against `puck-plugin`). Until that lands,
-  the sequence above is executed by hand — which means the guards the skill carries, chiefly the
-  pinned rebase base and the branch-delete predicate, are yours to apply rather than automatic.
-- **Squash to one delivery commit carrying the brain task number** before landing.
-- ⚠ **`deleteBranchOnMerge` is `false`** — measured 2026-08-21. Branches do not clean themselves
-  up; delete them explicitly. All three merge methods are enabled at the repo level, so nothing
-  stops a merge commit but the skill.
+- **Land via PR**: squash to one delivery commit, push to `origin`, open the PR,
+  rebase-and-merge, then fast-forward local `main` **from the remote** — never advance it
+  locally. The sequence above is executed by hand, so any guards a landing skill would carry —
+  chiefly the pinned rebase base and the branch-delete predicate — are yours to apply rather
+  than automatic.
+- **Squash to one delivery commit carrying the task number** before landing.
+- ⚠ **`deleteBranchOnMerge` has been `false`.** Branches do not clean themselves up; delete them
+  explicitly. All three merge methods have been enabled at the repo level, so nothing stops a
+  merge commit but discipline. Re-check both settings before relying on them.
 - **Work in a worktree**, never the main checkout.
 
 ## Install and runtime wiring
@@ -136,7 +158,7 @@ accrues advisories with nothing watching.
 Three pieces outside the repo, and the repo is useless without them.
 
 1. **`~/.local/bin/sigil`** — the built binary. ⚠ **No `install` recipe exists.** `just build`
-   writes `./sigil` into the repo (gitignored); the deployed copy was placed by hand. **Nothing
+   writes `./sigil` into the repo (gitignored); the deployed copy is placed by hand. **Nothing
    detects divergence between source and deployed binary** — a green `just check` says nothing
    about what is actually on disk at that path.
 2. **`~/.local/bin/sigil-helper`** — a three-line wrapper that reads the 1Password
@@ -144,53 +166,45 @@ Three pieces outside the repo, and the repo is useless without them.
    job is the env-var injection sigil deliberately refuses to do itself, keeping the Keychain
    dependency out of the Go binary.
 3. **The repo's own `.git/config`** — registers the helper for `https://github.com` and sets
-   `useHttpPath = true`, alongside the two remotes. ⛔ **Per-clone and never committed**, so it
-   does not travel with the repository — see *Remotes*. ⚠ This replaced an earlier
-   `~/.config/git/sigil-workspace.gitconfig` + `includeIf` arrangement scoped to the old
-   workspace path, retired 2026-08-21. If you find that file or an `includeIf` referencing it,
-   it is dead weight, not configuration to restore.
+   `useHttpPath = true`, alongside the `origin` remote. ⛔ **Per-clone and never committed**, so it
+   does not travel with the repository — see *Remotes*. ⚠ A global `includeIf` arrangement scoped
+   to a workspace path is the retired way of doing this; if you find one, it is dead weight, not
+   configuration to restore.
 
 Config lives at `~/.config/sigil/config.toml` — `op_key_ref` (an `op://` **pointer** to the App
 private key, never key material), `app_id`, and an `[installations]` table mapping repo owner to
-installation ID. Copy `config.example.toml` and fill it. ⚠ The live file is `0644`. It holds no
-secrets by design, but it does publish the App ID and installation IDs to any local user.
+installation ID. Copy `config.example.toml` and fill it. ⚠ It holds no secrets by design, but it
+does publish the App ID and installation IDs to any local user who can read it.
 
 ⛔ **Adding an `[installations]` entry may silently widen what agents can mint — and nothing
-here will tell you.** The agent permission rules that keep the full-token command away from
-agents are understood to deny it by matching the owner name literally, which couples them to this
-table holding **exactly** `prmanahan` and `mnemra` (the owners are measured, 2026-09-20; the
-coupling is **INHERITED AND UNVERIFIED** — see below). If that is right, adding a third owner
-means `sigil-helper token <newowner>` matches no deny rule: an agent can mint a
-**full-permission, write-capable** token for that owner, and the first sign of it is the token,
-not an error. The narrow `--rate-limit-only` form is unaffected either way — it verifies its own
-grant and fails closed.
+here will tell you.** Agent permission rules that keep the full-permission `sigil token <owner>`
+command away from agents may deny it by matching the owner name literally. If so, adding an
+owner to this table means `sigil-helper token <newowner>` matches no deny rule: an agent can mint
+a **full-permission, write-capable** token for that owner, and the first sign of it is the token,
+not an error. The narrow `--rate-limit-only` form is unaffected — it verifies its own grant and
+fails closed. Check any agent permission rules that match owners by name, in the same change that
+adds the owner.
 
-⚠ **The coupling above has NOT been confirmed from this root, and the rules were not found where
-they were looked for.** Searched 2026-09-20: `~/.claude/settings.json`,
-`~/.claude/settings.local.json`, and both `.claude/settings*.json` under this repo — **no rule
-mentioning sigil or the narrow command exists on any of them.** The rules are believed to live in
-mnemra-core's own settings, which is a different repository and deliberately not read from here.
-⇒ Treat this as a hazard to check before adding an owner, not as a described mechanism, and
-re-derive it from mnemra-core rather than from this paragraph.
+⚠ **This is PROSE, not mechanism, and that is the durable point.** Nothing in this repo checks
+the coupling — an allowlist of tool names cannot express a constraint that lives in a command's
+*argument*. If a mechanism is ever built, it belongs on the rule side (deny by default,
+allow-list the narrow form), not here.
 
-⚠ **This is PROSE, not mechanism, and that is the durable point.** Nothing in this repo, in
-sigil, or in mnemra-core checks the coupling — an allowlist of tool names cannot express a
-constraint that lives in a command's *argument*. Whoever adds an owner here updates those rules
-in the same change, or the widening ships unremarked. ⇒ If a mechanism is ever built, it belongs
-on the rule side (deny by default, allow-list the narrow form), not here.
+⚠ **No new owner is needed to evade a literal owner match.** `sigil token <owner>/<anything>`
+routes exactly like `sigil token <owner>`, because routing reads only the first path segment, so
+a rule that matches the argument as a whole string can be stepped around with a suffix.
 
-## Remotes — two of them, and which one you use matters
+## Remotes — one, `origin`, over https
 
-⛔ **This section states a REQUIREMENT, not the state of your clone.** Remotes and credential
+⛔ **This section states the CONVENTION, not the state of your clone.** Remotes and credential
 config live in `.git/config`, which is never committed — so none of it arrives with a `git
 clone` and none of it is true on a new machine until someone wires it. **Check, do not assume.**
 
-**The convention.** This project uses two remotes, and the remote name *is* the identity choice,
-because git picks its transport from the remote's URL:
+**The convention.** An agent's clone of a GitHub-backed repository carries one remote, `origin`,
+over https, so every git operation goes through the credential helper and therefore through Sigil:
 
 ```
-origin      https://github.com/<owner>/sigil.git   → agent + unattended work, via Sigil → the APP
-ssh_origin  git@github.com:<owner>/sigil.git       → Peter's own admin/fixup, over SSH → HIM
+origin      https://github.com/<owner>/sigil.git   → via Sigil → the APP
 ```
 
 **Confirm before pushing:**
@@ -199,77 +213,102 @@ ssh_origin  git@github.com:<owner>/sigil.git       → Peter's own admin/fixup, 
 git remote -v          # origin must be https:// — if it is git@, this clone is UNWIRED
 ```
 
-⛔ **A clone with a single `origin` on `git@` is unwired. Do not push agent work from it.** Wire
-it first — the README's setup section carries the credential-helper block and the remote
-commands. Pushing from an unwired clone silently authenticates as **Peter**, because SSH never
-consults git's credential system at all, so Sigil is not merely bypassed — it is never asked.
-
-⛔ **Agent work pushes to `origin`. Never to `ssh_origin`.** Not hypothetical: on 2026-08-21,
-before the split existed, a docs branch of agent work went out over SSH and GitHub recorded it
-as Peter. The constraint in his words: *"i need to be able via ssh and attribute the change to
-me when i do things, normally its an admin only or fixup i do, so more rare."*
-
-⚠ **A remote rename drags branch upstreams with it**, so a bare `git push` can change identity
-without changing any command you typed. Observed here the same day. **Prefer naming the remote
-explicitly over relying on an upstream**, and check `git config --get branch.<name>.remote`
-after any remote surgery.
+⛔ **A clone whose remote is on `git@` is unwired. Do not push agent work from it.** Wire it
+first — the README's setup section (step 11, "Register the helper") carries the credential-helper
+block, and its optional "second remote" section shows adding an `ssh_origin` SSH remote for a
+human's own pushes. That is an addition beside `origin`, never a replacement for it: an agent's
+clone keeps `origin` on https, which `git remote set-url origin
+https://github.com/<owner>/sigil.git` restores. A `git@` remote bypasses the credential helper
+entirely: SSH never consults git's credential system at all, so Sigil is not merely bypassed — it is never asked, and the push authenticates as
+whoever owns the SSH key (the maintainer), not as the App.
 
 ⚠ **A successful push proves authentication, not *which* helper supplied it** — `gh` holds a
 valid token too. To confirm Sigil served a request rather than something else, check that
 `~/.cache/sigil/<installation-id>.json` was written at that moment. A bare success does not
 establish it.
 
-⛔ **No `url.insteadOf` rewrite — it defeats the whole arrangement.** `insteadOf` applies when
-git resolves *any* URL, remote names included, so a `git@`→https rewrite converts `ssh_origin`
-too. **Measured 2026-08-21** in a throwaway repo: with the rewrite set,
-`git ls-remote --get-url ssh_origin` returns the **HTTPS** URL. The rewrite existed only to force
-a single SSH remote onto HTTPS; choosing transport by remote name replaces it. ⚠ This is the
-shape that looks like the obvious fix, which is why the ban is recorded rather than assumed.
+⛔ **No `url.insteadOf` rewrite as a substitute for wiring the remote.** `insteadOf` applies when
+git resolves *any* URL, so the transport actually used can differ from the one configured.
+**Measured** in a throwaway repo: with a `git@`→https rewrite set, `git ls-remote --get-url
+<remote>` returns the rewritten **HTTPS** URL. Fix the remote's URL itself instead; a rewrite is
+the shape that looks like the obvious fix, which is why the ban is recorded rather than assumed.
 
-⛔ **`/merge` cannot land this repo — it treats more than one remote as a hard stop** (`#3410`,
-filed against `puck-plugin`). Until that is fixed, landing here is done by hand: squash to one
+⛔ **Landing here is done by hand**, as described under *Remote and merge posture*: squash to one
 delivery commit, push to `origin`, open the PR, rebase-and-merge, then fast-forward local `main`
-from the remote. Peter: *"merge skill is fixable we own it, so not critical."*
+from the remote.
 
 ## Security invariants — do not regress these
 
-Stated at `main.go:20-39`. Each names what breaking it costs.
+Stated in `main.go`'s header comment. Each names what breaking it costs.
 
 - **The App private key never touches disk.** Resolved in-process from 1Password over the API,
   parsed from memory. ⇒ Breaking it puts the root credential that mints every token on disk;
   recovery is key rotation plus re-install.
 - **`OP_SERVICE_ACCOUNT_TOKEN` is env-only.** Never written, never logged, no field for it on
   `Config`. The wrapper injects it; sigil never reads the Keychain. This is secret zero.
-- **The token leaves by exactly one channel.** ⚠ Signature and convention only — see the false
-  green above. **This is the invariant most likely to break silently.**
+- **The token leaves by exactly one channel.** ⚠ Signature and convention, plus two default-gate
+  checks: a test for `writeCredentialResponse` alone, and the built-binary check on `sigil get`'s
+  cache-hit path — see the false green above. **This is the invariant most
+  likely to break silently.**
 - **Cache files and the cache dir are `0600`/`0700`, re-chmod'd explicitly** after creation,
   because POSIX ignores the mode argument when the file already exists. ⇒ Deleting the "redundant"
   chmod leaves a pre-existing `0644` file at `0644`, holding live GitHub tokens. **This is the
   best-mechanised invariant in the repo** — defensive code, correctly tested, reasoning inline.
 - **The cache holds a token and an expiry, nothing else.**
-- **Routing is fail-closed and runs before any network call.** Unknown owner errors; no default
-  installation is ever guessed. ⇒ Breaking it mints a token for the wrong installation.
-- **Scheme validation runs before the key read**, so a misconfigured API base is caught with no
-  secret in memory. The *ordering* is the property, and no test asserts the ordering directly.
-- **Error messages quote types, status codes and lengths — never bytes.**
+- **Routing is fail-closed and runs before any network call and before the key read, on all three
+  token paths** (`sigil get`, `sigil token <owner>`, `sigil token --rate-limit-only`). Unknown
+  owner errors; no default installation is ever guessed. ⇒ Breaking it mints a token for the wrong
+  installation.
+- **Order on `sigil get` and `sigil token <owner>`: config → API-base scheme check → (token path
+  only) terminal check → owner routing → cache lookup → key read, on a cache miss only.** A cache
+  hit or an unknown owner never reads the key, so never touches 1Password; the key is loaded once
+  and reused for the 401 retry (`getInstallationTokenLazy` in `token.go`). ⇒ Breaking it makes
+  every `git` operation read 1Password even on a cache hit, and makes an unknown owner fail with a
+  key error instead of the routing error. `--rate-limit-only` is config → scheme check → routing
+  → key read, and never reads the cache.
+  Pinned in the default gate: the key-load order and call counts by `lazy_key_test.go` (key
+  loader), and the same order through the built binary with no service-account token by
+  `cli_cache_test.go` — cache hit for `get` and `token`, unknown owner for `get` and
+  `--rate-limit-only` (none for `token <owner>`), and the terminal gate refusing under a pipe
+  **with a live cache entry present** (`TestCLI_Token_NonTerminal_LiveCache_StillRefuses`; moving
+  the gate into the key-loader closure made it fail while the empty-cache refusal test stayed
+  green). The scheme-before-key-read part is asserted for `sigil token`
+  (`TestCLI_InsecureAPIBaseURL_ExitsNonZero`) and unasserted for `sigil get` and
+  `--rate-limit-only`.
+  One 30-second context, created before the key read, covers the key read and the API exchange
+  together on all three paths: `readKey` hands it to the 1Password client and the secret
+  resolution, so a slow key read spends part of the same budget. ⚠ **That deadline bounds the
+  1Password network waits, not everything the SDK does.** The WASM core load and guest compute
+  are not interrupted: onepassword-sdk-go v0.4.0 sets no manifest timeout (so
+  `WithCloseOnContextDone` stays off), and `GetExtismCore` loads the core under
+  `context.Background()`. Do not read the 30 s as a ceiling on a run.
+  Pinned: `getInstallationTokenLazy` passes the caller's context, deadline included, to the key
+  loader (`TestGetInstallationTokenLazy_LoadKeyReceivesCallerContext`). Not pinned: that `readKey`
+  forwards it to the SDK, at its call sites in `cmdGet`, `cmdToken` and `cmdTokenNarrowed`, or
+  that the SDK aborts on it. The test proves only that the lazy function forwards its context;
+  the rest needs real 1Password.
+- **Error messages carry no key or token material.** They quote types, status codes and lengths,
+  and also file paths (the cache directory), URLs (the API base) and GitHub response strings (the
+  granted permission names, repository name and `repository_selection` in `verifyNarrowedGrant`'s
+  mismatch errors). Wrapped library errors pass the library's own text through unchanged: the
+  PEM/DER parse (asserted not to leak key bytes for `parseRSAPrivateKey`), and the 1Password SDK
+  errors in `readKey` (client init, secret resolve), the JSON decodes and the HTTP transport
+  errors, none of which is asserted.
 - **Cached expiry is GitHub's `expires_at` minus five minutes**, so a cache hit can never hand
   back a token within five minutes of death.
 - **A `--rate-limit-only` token is verified against GitHub's actual grant before it is trusted
   or printed, and is never cached.** `token_narrow.go`'s `verifyNarrowedGrant` checks
-  `permissions`, `repository_selection` and `repositories` from the response — four conditions,
-  all ANDed, exact match — not from what was requested. Any mismatch revokes the token
-  (`DELETE /installation/token`) and returns an error instead. ⇒ Breaking the verification lets
-  a silently-widened grant reach stdout. **Measured by Peter, live run of
-  `live_narrow_probe_test.go`, 2026-09-17, mnemra installation `143101545`** (not independently
-  re-verified by Forge — Keychain access was denied to the implementing session, see `#3647`):
-  an access_tokens request body of `{"permissions":{}}` was granted **all seven** installation
-  permissions including write, not none; a request body of
-  `{"permissions":{"metadata":"read"},"repositories":[]}` was granted `repository_selection:
-  "all"`, not zero repositories. Both are exactly the class this verification exists to catch —
-  do not weaken `verifyNarrowedGrant` to a single `permissions["metadata"]=="read"` check, which
-  passes the first of these two silently.
-- **The full-permission `sigil token <owner>` refuses a non-terminal stdout** (`#3667`), from
-  the credential-free preflight band: after the scheme check, before the key read, before any
+  `permissions`, `repository_selection` and `repositories` from the response — five conditions,
+  all ANDed, exact match (the permission set; `repository_selection`; the repository count; the
+  repository name; and a refusal of a private repository) — not from what was requested. Any
+  mismatch revokes the token (`DELETE /installation/token`) and returns an error instead. ⇒ Breaking the verification lets
+  a silently-widened grant reach stdout. GitHub's grant does not always match the request: an
+  access_tokens body of `{"permissions":{}}` has been observed to grant every installation
+  permission including write, and `{"permissions":{"metadata":"read"},"repositories":[]}` to
+  select all repositories. Do not weaken `verifyNarrowedGrant` to a single
+  `permissions["metadata"]=="read"` check, which passes the first of these silently.
+- **The full-permission `sigil token <owner>` refuses a non-terminal stdout**, from the
+  credential-free preflight band: after the scheme check, before the App key is read, before any
   network call — so a refused run reads no secret and makes no `access_tokens` POST. ⇒ Breaking
   it turns the ordinary unattended invocation (a pipe, a redirect to a file, an agent shell)
   from a loud immediate failure back into a silent mint.
@@ -278,58 +317,45 @@ Stated at `main.go:20-39`. Each names what breaking it costs.
   open: `sigil get` is itself an unattended full-permission token printer by design (see
   gotchas — it dominates the other three); the cache already holds a live token on disk, so
   `sigil token <owner> > /dev/null` mints into the cache rather than wasting the mint; a pty
-  walks straight through and **need not even be allocated** — measured 2026-09-20, a bare
-  `> /dev/ttysNNN` into a live tmux pane this user already owns (12 such devices existed that
-  day; the device number is whatever tmux allocated, not a fixed path), read back with `tmux
-  capture-pane -p`; and `/dev/null` is a character device, so that redirect is permitted.
-  The gate narrows the *accidental* case to a loud failure. The agent permission rule is what
-  keeps this command out of unattended runs, and nothing here replaces it.
+  walks straight through and **need not even be allocated** — redirecting into a terminal device
+  the user already owns is enough; and `/dev/null` is a character device, so that redirect is
+  permitted. The gate narrows the *accidental* case to a loud failure. An agent permission rule is
+  what keeps this command out of unattended runs, and nothing here replaces it.
 
 ## Per-repo gotchas
 
 - ⛔ **`sigil get` IS an on-demand, non-interactive, FULL-PERMISSION token printer — by design,
-  and it dominates every bypass the `#3667` TTY gate documents.** Three lines on stdin —
+  and it dominates every bypass the `sigil token` TTY gate documents.** Three lines on stdin —
   `protocol=https`, `host=github.com`, `path=<owner>/<anything>` — and it writes
   `username=x-access-token` / `password=<full-permission installation token>` to stdout under a
-  **pipe**. No pty, no prior git operation, no cache read, no subcommand, nothing the gate is
+  **pipe**. No pty, no prior git operation, a warm cache not required (a cold one mints), no subcommand, nothing the gate is
   near. ⚠ **`resolveInstallation` reads only the FIRST path segment**, so the repo half is
   arbitrary: `path=myorg/x` routes identically to `path=myorg/real-repo`. This is **required,
   not a defect** — git drives the credential helper over pipes on every invocation, so gating it
-  would break every git operation on every wired repository, and `#3667` AC#5 mandates leaving
-  it alone. A stdout gate structurally cannot reach it. ⇒ **Do not read the `sigil token` TTY
-  gate as controlling access to full-permission tokens**: the cheaper, fully-supported,
-  unattended path to the same credential is the helper itself. **`#3673`** is the filed
-  follow-up — narrow the grant the helper requests (`exchange.go` POSTs `access_tokens` with a
-  **nil body**, so git receives all seven installation permissions including write when it needs
-  repo read/write on one repo); the narrowing machinery already exists from `#3647`.
-- ⛔ **`hardening_compilefail_test.go` is a TDD fossil, and its header is a lie.** It says the
-  package "will not compile until Forge implements them" — all three functions exist, and its four
-  tests are ordinary tests that pass under a plain `go test ./...`. There is no build tag anywhere
-  in the repo. **The risk is inverted from the obvious one:** nothing is silently skipped; instead
-  a reader believes the file needs special invocation and either avoids it or "fixes" the stale
-  comment by deleting live tests.
-- ⚠ **Other in-code comments are stale the same way.** `hardening_test.go` describes a
-  `context.Background()` gap that is closed, citing line numbers that no longer resolve. Several
-  tests carry `RED:` / `GREEN` prefixes and bare Warden finding IDs (`M1`, `L1`–`L4`, `N2`, `N3`)
-  that are meaningless without the review record.
+  would break every git operation on every wired repository. A stdout gate structurally cannot
+  reach it. ⇒ **Do not read the `sigil token` TTY gate as controlling access to full-permission
+  tokens**: the cheaper, fully-supported, unattended path to the same credential is the helper
+  itself. Narrowing the grant the helper requests is a known follow-up (`exchange.go` POSTs
+  `access_tokens` with a **nil body**, so git receives every installation permission including
+  write when it needs repo read/write on one repo); the narrowing machinery already exists in
+  `token_narrow.go`.
 - ⛔ **The 1Password field TYPE is a landmine that has already detonated.** A *concealed* field
-  strips PEM newlines — that was `#1892`. The key must be stored as multiline text or a file
-  attachment. Three documents describe three different shapes; `config.example.toml` is
-  authoritative. The failure surfaces as "no PEM block found" with nothing pointing at field type,
-  **and the function that reports it has no test.**
+  strips PEM newlines. The key must be stored as multiline text or a file attachment.
+  `config.example.toml` is authoritative on the shape. The failure surfaces as "no PEM block
+  found" with nothing pointing at field type; `parseRSAPrivateKey`'s tests reproduce the
+  symptom, but only a real 1Password round trip reproduces the cause.
 - ⛔ **The empty `helper =` line in the gitconfig is deliberate** — `credential.helper` is a list
   accumulated across system → global → local, and an empty value resets it. Delete it as untidy
-  and whatever was configured earlier answers first. **Measured 2026-08-21: that is
-  `!/opt/homebrew/bin/gh auth git-credential`, from `~/.gitconfig`** — not `osxkeychain`, which
-  is what the original design note assumed. `gh` holds a valid token, so it answers
-  *successfully* every time and Sigil is never consulted. The failure is silent by construction:
-  git operations keep working, just not through Sigil.
+  and whatever was configured earlier answers first, typically the `gh` credential helper.
+  `gh` holds a valid token, so it answers *successfully* every time and Sigil is never
+  consulted. The failure is silent by construction: git operations keep working, just not
+  through Sigil.
 - ⛔ **`useHttpPath = true` is load-bearing.** Without it git sends no `path`, routing gets an
   empty owner, and every fetch fails with an error that never mentions gitconfig.
 - ⚠ **`.gitignore` has two UNANCHORED entries: `config.toml` and `*.pem`.** They match at any
   depth. A fixture named `testdata/config.toml` would be **silently untracked** — the existing
   fixtures dodge this only by their names. A PEM fixture cannot be committed at all; generate keys
-  in-process instead, as `jwt_test.go` already does.
+  in-process instead, as `jwt_test.go` and `parse_key_test.go` do.
 - ⚠ **`run()`'s `default:` arm routes any unrecognised subcommand to `cmdGet`.** So `sigil --help`
   blocks reading stdin and then behaves as a credential helper. There is no help output.
 - ⚠ **`$HOME` is read directly, rejecting `os.UserConfigDir()` / `os.UserCacheDir()` on purpose** —
@@ -342,46 +368,43 @@ Stated at `main.go:20-39`. Each names what breaking it costs.
 - **28 MB binary, multi-second cold build.** The 1Password Go SDK is a WASM core, so the tree
   embeds a WASM runtime, the Extism plugin framework, and an OTLP/protobuf stack. Three direct
   dependencies, nine indirect.
-- **Go 1.26.4** in `go.mod` — a bare `go` directive, so a **minimum, not a pin**. No `toolchain`
-  line. Tests use only the standard `testing` package: no assertion library, no mocks, no golden
-  files.
+- **Go 1.26.10** in `go.mod` — a `go` directive, so a **minimum, not a pin**, raised from 1.26.4
+  to take the standard-library advisories fixed in 1.26.10. There is deliberately no `toolchain`
+  line. **Measured 2026-11-09 with go1.26.10 darwin/arm64, in a throwaway module:** with
+  `go 1.26.10` and `toolchain go1.26.10`, `go build` fails (`go: updates to go.mod needed; to
+  update it: go mod tidy`) and `go mod tidy` removes the line; a `toolchain` line newer than the
+  `go` line (`go 1.26.4` plus `toolchain go1.26.10`) is kept. So the Go tool drops a toolchain
+  line equal to the `go` line, and a `toolchain` line therefore cannot be the way to pin
+  1.26.10 here. Tests use only the standard `testing` package: no
+  assertion library, no mocks, no golden files.
 
 ## What is still open
 
-- ⛔ **`G-0016`'s permission list is STALE — do not quote it.** The ADR documents three
-  permissions (`contents:write`, `pull_requests:write`, `metadata:read`). **Measured live
-  2026-08-21**, the org installation carries **seven**: `actions:write`, `checks:write`,
-  `contents:write`, `issues:write`, `metadata:read`, `pull_requests:write`, `workflows:write`,
-  at `repository_selection: all`. ⚠ **That reading covers the ORG installation only** — the
-  personal-account installation returns 403 without App-authorized auth and is unverified.
-  `#2820` — append the drafted amendment plus a `checks:write` row — has been open since
-  2026-07-25 with **no tripwire**; it is parked, not deferred. ⇒ **When writing about
-  permissions, read them live and say which installation you read.** Do not repeat the ADR's
-  list, and do not repeat the numbers above without re-measuring.
-- **Rolling the two-remote shape out to other repositories** — `#3409`. There is deliberately no
-  global config doing this any more: the `includeIf` that once served `~/claude_workspace` was
-  removed 2026-08-21 and nothing replaced it. Every repo needing unattended access is wired
-  individually, per clone. ⚠ **No code change is involved**: `resolveInstallation` reads git's
-  credential `path` (`owner/repo`), never a filesystem path, and no `.go` file carries a
-  hardcoded path — measured 2026-08-21. Keying the map by `owner/repo` rather than owner *would*
-  be a code change, and this shape does not need it.
-- ⚠ **A new repo may also need adding to the GitHub App installation.** The org installation
-  measured `repository_selection: all` on 2026-08-21; `#1880` recorded personal-account installs
-  as select-repos, and that one returns 403 without App-authorized auth — unverified.
-- **`#3673`** — narrow the credential-helper grant so `git` gets repo-scoped access instead of
-  the installation's full permissions. Filed 2026-09-20 off the `#3667` review; **deliberately
-  deferred, not deprioritised**, and it is the git-critical path, so it needs a spec and a real
-  acceptance run rather than a quick patch. The property it closes is the first per-repo gotcha
-  above. ⚠ Read the activity log on the task before starting — the full rationale is there.
-- **`#2651`, 2026-10-21** — review whether the `actions` permission can narrow to `read`. A date
-  rather than a usage trigger, deliberately: non-use emits no signal, so a usage-based trigger
-  would rot silently.
-- **The two test gaps** — the channel-separation invariant and `parseRSAPrivateKey` — are the two
-  things worth closing before this repo is ever made public. Both are cheap and neither needs
-  1Password.
-- **N-Apps** (one GitHub App per agent) was decided against, and the ruling names its own reversal
+- ⚠ **Installation permissions: read them live, and say which installation you read.** The
+  installation carries more permissions than the original design documented, so do not quote any
+  written list of them without re-measuring.
+- **Rolling the https-`origin` wiring out to other repositories.** There is deliberately no global
+  config doing this: every repo needing unattended access is wired individually, per clone. ⚠ **No
+  code change is involved**: `resolveInstallation` reads git's credential `path` (`owner/repo`),
+  never a filesystem path, and no `.go` file carries a hardcoded path. Keying the map by
+  `owner/repo` rather than owner *would* be a code change, and this shape does not need it.
+- ⚠ **A new repo may also need adding to the GitHub App installation.** An org installation may
+  be `repository_selection: all`; a personal-account installation may be select-repos — check
+  each live.
+- **Narrow the credential-helper grant** so `git` gets repo-scoped access instead of the
+  installation's full permissions. **Deliberately deferred, not deprioritised**, and it is the
+  git-critical path, so it needs a spec and a real acceptance run rather than a quick patch. The
+  property it closes is the first per-repo gotcha above.
+- **The two test gaps were addressed; one remains partly open.** `parseRSAPrivateKey` is covered
+  (see above). The channel-separation invariant is covered for `writeCredentialResponse` and for
+  `sigil get`'s cache-hit path through the built binary; a token printed to stderr from the
+  cache-miss path or the other subcommands still passes `just check`, and the only end-to-end check
+  of those (`TestCLI_LeakScan_TokenNotInStderr`) is still gated on 1Password. Closing the wider
+  invariant needs either a key-source seam so the built binary can reach the mint path in-gate, or a
+  mechanism that bounds what may write to `os.Stderr` — neither exists.
+- **One GitHub App per agent** was decided against, and the ruling names its own reversal
   condition: a second execution host. Self-announcing; nothing to watch for.
-- **Whether `.claude/` stays gitignored** — undecided. Peter, 2026-08-21: *"long term we may un
-  gitignore .claude since that is where the agent memories except pucks are written. its ok for
-  now though."* ⇒ Currently ignored, and that is deliberate rather than an oversight. **Do not
-  "fix" the `.gitignore` entry**, and do not read the absence of tracked agent memory as a defect.
+- **Whether `.claude/` stays gitignored** — undecided. It may be un-ignored later, since agent
+  memories are written there. Currently ignored, and that is deliberate rather than an oversight.
+  **Do not "fix" the `.gitignore` entry**, and do not read the absence of tracked agent memory as
+  a defect.

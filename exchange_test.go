@@ -1,6 +1,6 @@
 package main
 
-// AC#4 (exchange layer): Installation-token exchange against an httptest mock GitHub server.
+// Exchange layer: Installation-token exchange against an httptest mock GitHub server.
 // These tests cover the raw HTTP exchange function in isolation.
 // The re-mint-on-401 path (higher level) is tested in token_test.go.
 
@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,7 +73,7 @@ func TestExchangeInstallationToken_HappyPath(t *testing.T) {
 
 // TestExchangeInstallationToken_401ReturnsError verifies that a 401 Unauthorized
 // response causes exchangeInstallationToken to return an error. The caller
-// (getInstallationToken) is responsible for re-minting the JWT and retrying.
+// (getInstallationTokenLazy) is responsible for re-minting the JWT and retrying.
 func TestExchangeInstallationToken_401ReturnsError(t *testing.T) {
 	// Given: a mock GitHub API that returns 401 Unauthorized
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -131,11 +132,10 @@ func TestExchangeInstallationToken_404ReturnsError(t *testing.T) {
 // TestExchangeInstallationToken_401ReturnsErrUnauthorizedSentinel strengthens the
 // basic 401 test by asserting the specific sentinel error (errUnauthorized) is in
 // the error chain. errors.Is catches regressions that return a generic error for
-// 401, which would silently break the re-mint path in getInstallationToken.
+// 401, which would silently break the re-mint path in getInstallationTokenLazy.
 //
-// N2 status: GREEN with current implementation (exchange.go:49-50 already returns
-// errUnauthorized). This test documents the sentinel contract and guards against
-// accidental replacement with a generic fmt.Errorf.
+// This pins the sentinel contract and guards against accidental replacement
+// of errUnauthorized with a generic fmt.Errorf.
 func TestExchangeInstallationToken_401ReturnsErrUnauthorizedSentinel(t *testing.T) {
 	// Given: a mock server that returns 401 Unauthorized.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +156,7 @@ func TestExchangeInstallationToken_401ReturnsErrUnauthorizedSentinel(t *testing.
 	}
 }
 
-// TestExchangeInstallationToken_SendsEmptyBody verifies #3647's "git path
+// TestExchangeInstallationToken_SendsEmptyBody verifies the "git path
 // unchanged" requirement: exchangeInstallationToken (used by both cmdGet and
 // the plain `sigil token <owner>` form) still sends a nil/empty body — the
 // narrowed --rate-limit-only path is a sibling (token_narrow.go), not a
@@ -228,5 +228,49 @@ func TestExchangeInstallationToken_CorrectInstallID(t *testing.T) {
 				t.Errorf("URL path: got %q, want %q", gotPath, wantPath)
 			}
 		})
+	}
+}
+
+// TestExchangeInstallationToken_EmptyTokenIsError: a 201 whose token is empty
+// must not pass as a credential (getRateLimitOnlyToken already refuses the same
+// shape).
+func TestExchangeInstallationToken_EmptyTokenIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(githubInstallationResponse{
+			Token:     "",
+			ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+	}))
+	defer srv.Close()
+
+	token, _, err := exchangeInstallationToken(context.Background(), srv.URL, "test.jwt", 12345)
+	if err == nil {
+		t.Fatal("expected an error for an empty token, got nil")
+	}
+	if token != "" {
+		t.Errorf("token: got %q, want empty", token)
+	}
+}
+
+// TestExchangeInstallationToken_BadExpiresAt_ErrorQuotesNoResponseBytes: the
+// repo invariant is that error messages quote types, status codes and lengths,
+// never response bytes. A malformed expires_at must fail without echoing it.
+func TestExchangeInstallationToken_BadExpiresAt_ErrorQuotesNoResponseBytes(t *testing.T) {
+	const marker = "not-a-time-SENTINEL-9f3a"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(githubInstallationResponse{Token: "ghs_x", ExpiresAt: marker})
+	}))
+	defer srv.Close()
+
+	_, _, err := exchangeInstallationToken(context.Background(), srv.URL, "test.jwt", 12345)
+	if err == nil {
+		t.Fatal("expected an error for an unparseable expires_at, got nil")
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Errorf("error quotes response bytes: %v", err)
 	}
 }

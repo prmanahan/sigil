@@ -16,13 +16,13 @@ import (
 )
 
 // errUnauthorized is the sentinel returned when GitHub responds with 401.
-// getInstallationToken uses errors.Is on this to trigger the re-mint retry path.
+// getInstallationTokenLazy uses errors.Is on this to trigger the re-mint retry path.
 var errUnauthorized = errors.New("github API: 401 Unauthorized")
 
-// exchangeHTTPClient is used for all GitHub API calls. A 30-second timeout
-// guards against an unresponsive server when the caller passes context.Background()
-// (the CLI entry points). Context deadlines shorter than 30 s take precedence
-// because http.NewRequestWithContext propagates them through the transport.
+// exchangeHTTPClient is used for all GitHub API calls. Its 30-second timeout is
+// a backstop for a caller that passes a context with no deadline; the CLI entry
+// points pass their own 30 s context. A context deadline shorter than 30 s takes
+// precedence because http.NewRequestWithContext propagates it through the transport.
 var exchangeHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // installationTokenResponse is the subset of GitHub's access_tokens response
@@ -67,7 +67,14 @@ func exchangeInstallationToken(ctx context.Context, apiBaseURL, appJWT string, i
 
 	exp, err := time.Parse(time.RFC3339, body.ExpiresAt)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("exchangeInstallationToken: parse expires_at %q: %w", body.ExpiresAt, err)
+		// Neither the value nor err is quoted: time.Parse's error embeds the
+		// offending response text, and error messages never carry response bytes.
+		return "", time.Time{}, errors.New("exchangeInstallationToken: expires_at is not an RFC 3339 timestamp")
+	}
+
+	// A 201 with an empty token must not pass as a credential.
+	if body.Token == "" {
+		return "", time.Time{}, errors.New("exchangeInstallationToken: access_tokens response had an empty token")
 	}
 
 	return body.Token, exp, nil

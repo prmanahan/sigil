@@ -1,15 +1,14 @@
 package main_test
 
-// AC#5 + AC#7: Black-box CLI tests for Sigil's credential-helper protocol and leak scan.
+// Black-box CLI tests for Sigil's credential-helper protocol and leak scan.
 //
 // These tests build the sigil binary and exec it, testing only its externally
 // observable behaviour (stdin/stdout/stderr/exit-code). No implementation details
 // are assumed. The SIGIL_GITHUB_API_URL env var is the sole testable seam for
 // redirecting GitHub API calls.
 //
-// Red state: tests compile fine but fail at runtime because the current binary
-// is the Layer-B 1Password smoke test, not the real credential helper. That is
-// the expected red.
+// Tests that need real 1Password credentials skip unless OP_SERVICE_ACCOUNT_TOKEN
+// and SIGIL_TEST_OP_KEY_REF are both set; everything else runs in the default gate.
 
 import (
 	"encoding/json"
@@ -136,7 +135,7 @@ app_id = %d
 `, opKeyRef, appID, owner, installID)
 }
 
-// --- AC#5: Credential-helper protocol ---
+// --- Credential-helper protocol ---
 
 // TestCLI_HelperGet_NonGitHubHost verifies that a credential request for a
 // non-GitHub host produces no output and exits 0 (no-op, per the spec).
@@ -197,7 +196,7 @@ func TestCLI_HelperErase_NoOp(t *testing.T) {
 	}
 }
 
-// TestCLI_HelperGet_ValidGitHubPath verifies the full AC#5 happy path:
+// TestCLI_HelperGet_ValidGitHubPath verifies the full happy path:
 // stdin with a GitHub HTTPS path → stdout containing username and password lines.
 // Requires a real 1Password service account token (OP_SERVICE_ACCOUNT_TOKEN).
 func TestCLI_HelperGet_ValidGitHubPath(t *testing.T) {
@@ -287,23 +286,8 @@ func TestCLI_MissingConfig_ExitsNonZero(t *testing.T) {
 	}
 }
 
-// TestCLI_UnknownOwner_ExitsNonZero verifies that a request for a repo whose owner
-// is not in the installations map causes sigil to fail closed with non-zero exit.
-func TestCLI_UnknownOwner_ExitsNonZero(t *testing.T) {
-	// Given: a config that only knows about "known-owner"
-	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "known-owner"))
-	stdin := "protocol=https\nhost=github.com\npath=unknown-owner/repo\n\n"
-
-	// When: sigil get is called for an unknown owner
-	result := runSigil(t, []string{"get"}, stdin, []string{
-		"HOME=" + home,
-	})
-
-	// Then: exits non-zero (fail closed — unknown owner is an error)
-	if result.exitCode == 0 {
-		t.Errorf("expected non-zero exit for unknown owner (fail-closed), got 0\nstdout: %s", result.stdout)
-	}
-}
+// The unknown-owner case (fail closed at routing, before any key read) is
+// TestCLI_Get_UnknownOwner_FailsAtRouting_NotKeyRead in cli_cache_test.go.
 
 // TestCLI_MissingOPServiceAccountToken_ExitsNonZero verifies that if
 // OP_SERVICE_ACCOUNT_TOKEN is not set, sigil fails closed with non-zero exit
@@ -357,7 +341,7 @@ func TestCLI_TokenSubcommand_MissingConfig_ExitsNonZero(t *testing.T) {
 	}
 }
 
-// --- sigil token --rate-limit-only argument polarity (#3647) ---
+// --- sigil token --rate-limit-only argument polarity ---
 //
 // These reject every disallowed shape BEFORE config load: HOME points at an
 // empty temp dir with no config file, so if dispatch fell through to
@@ -368,7 +352,7 @@ func TestCLI_TokenSubcommand_MissingConfig_ExitsNonZero(t *testing.T) {
 // downstream of it.
 
 // TestCLI_TokenRateLimitOnly_RejectedShapes_NoConfigLoad table-drives every
-// disallowed `sigil token` shape named in #3647: an unknown flag, a typo'd
+// disallowed `sigil token` shape: an unknown flag, a typo'd
 // flag, the flag placed after the positional, extra positionals (both the
 // plain and flag forms), a missing repo, and a malformed <owner>/<repo>
 // (two slashes, empty owner, empty repo).
@@ -464,7 +448,7 @@ func TestCLI_TokenRateLimitOnly_AcceptedShape_ReachesConfigLoad(t *testing.T) {
 	}
 }
 
-// --- #3667: `sigil token <owner>` refuses a non-terminal stdout ---
+// --- `sigil token <owner>` refuses a non-terminal stdout ---
 //
 // These tests pin WHICH path is gated, which is the whole risk of the change.
 // Every one of them runs with stdout captured through a pipe (what runSigil and
@@ -477,9 +461,11 @@ func TestCLI_TokenRateLimitOnly_AcceptedShape_ReachesConfigLoad(t *testing.T) {
 //	stderr says "OP_SERVICE_ACCOUNT_TOKEN"  ⇒ the run reached readKey — NOT gated
 //	stderr says "stdout is not a terminal"  ⇒ the run was refused before readKey
 //
-// and the two are mutually exclusive. No network assertion is needed for AC#2:
-// the access_tokens POST is strictly downstream of readKey in cmdToken's
-// straight-line code, and readKey demonstrably did not run.
+// and the two are mutually exclusive. These runs use an empty cache, so an
+// ungated run reaches the key read. No network assertion is needed: the
+// access_tokens POST is strictly downstream of the key read, and the key read
+// demonstrably did not run. A live cache entry is covered separately by
+// TestCLI_Token_NonTerminal_LiveCache_StillRefuses.
 
 // stdoutNotATerminalMarker is the distinctive fragment of the refusal message.
 // Hardcoded rather than imported: cli_test.go is package main_test and a Go main
@@ -524,7 +510,7 @@ func envForGateTest(t *testing.T) []string {
 	return append(env, "HOME="+home)
 }
 
-// TestCLI_TokenFullForm_NonTerminalStdout_Refuses covers AC#1, AC#2 and AC#3:
+// TestCLI_TokenFullForm_NonTerminalStdout_Refuses covers the full-permission refusal:
 // the full-permission form with stdout on a pipe exits non-zero, prints nothing
 // to stdout, names the reason, and is refused BEFORE the 1Password key read
 // (hence before any network call).
@@ -583,10 +569,9 @@ func TestCLI_TokenFullForm_TerminalStdout_ReachesKeyRead(t *testing.T) {
 	}
 }
 
-// TestCLI_TokenRateLimitOnly_NonTerminalStdout_Unaffected covers AC#4: the
-// narrowed form is the sanctioned unattended path and must be completely
-// unaffected by stdout being a pipe. It reaches the key read, so it was not
-// gated.
+// TestCLI_TokenRateLimitOnly_NonTerminalStdout_Unaffected pins that the
+// narrowed form, the sanctioned unattended path, is completely unaffected by
+// stdout being a pipe. It reaches the key read, so it was not gated.
 //
 // This is a distinct test from TestCLI_TokenRateLimitOnly_AcceptedShape_ReachesConfigLoad
 // above, which uses an EMPTY home and so would stop at config load before a
@@ -605,7 +590,7 @@ func TestCLI_TokenRateLimitOnly_NonTerminalStdout_Unaffected(t *testing.T) {
 	}
 }
 
-// TestCLI_HelperGet_NonTerminalStdout_Unaffected covers AC#5, the catastrophic
+// TestCLI_HelperGet_NonTerminalStdout_Unaffected covers the catastrophic
 // failure mode: git drives `sigil get` over pipes on every invocation, so a gate
 // reaching that handler — directly or through a shared helper — breaks every git
 // operation on every wired repository, silently from git's point of view.
@@ -645,7 +630,7 @@ func TestCLI_DoctorSubcommand_MissingConfig_ExitsNonZero(t *testing.T) {
 	}
 }
 
-// --- AC#7: Leak scan ---
+// --- Leak scan ---
 
 // TestCLI_InsecureAPIBaseURL_ExitsNonZero verifies that SIGIL_GITHUB_API_URL with a
 // non-https non-loopback scheme causes sigil to fail closed before reading any
@@ -654,10 +639,9 @@ func TestCLI_DoctorSubcommand_MissingConfig_ExitsNonZero(t *testing.T) {
 // Loopback addresses (http://127.0.0.1) MUST remain allowed — existing httptest
 // tests rely on them. Only cleartext to a remote host is rejected.
 //
-// L1 status: RED. Current code validates no scheme: cmdToken calls readKey before
-// any URL inspection, so the error is "OP_SERVICE_ACCOUNT_TOKEN is not set" (stderr
-// does not mention https/scheme). Forge must validate the API base URL scheme
-// BEFORE readKey so the check is credential-free.
+// The scheme is validated BEFORE readKey so the check is credential-free: a
+// failure that instead read "OP_SERVICE_ACCOUNT_TOKEN is not set" (with no
+// mention of https/scheme in stderr) would mean the check ran after the key read.
 //
 // OP_SERVICE_ACCOUNT_TOKEN is stripped from the environment to make the test
 // deterministic regardless of the CI/developer environment.
@@ -766,10 +750,9 @@ func TestCLI_LeakScan_NoPEMMarkersInOutput(t *testing.T) {
 // sanctioned stdout channel, the same token value does NOT appear in stderr.
 // This is the channel-separation invariant, checked at both of Sigil's
 // stdout-emission sites: `sigil get`'s `password=` line (writeCredentialResponse)
-// and `sigil token --rate-limit-only`'s fmt.Println (cmdTokenNarrowed, #3647
-// Warden finding #2 — this second site previously had no leak-scan coverage
-// at all). Requires 1Password credentials; stays gated on that exactly as
-// before — this does not run under `just check`.
+// and `sigil token --rate-limit-only`'s fmt.Println (cmdTokenNarrowed). It
+// requires 1Password credentials and skips without them, so it does not run
+// under `just check`.
 func TestCLI_LeakScan_TokenNotInStderr(t *testing.T) {
 	skipIfNoOPToken(t)
 
