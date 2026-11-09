@@ -22,3 +22,13 @@ fmt-check:
 
 # Full verification — what dispatch `verify` names
 check: vet fmt-check test
+
+# Install a COPY of the pre-commit secret scan into this clone's git hooks dir
+# (per-clone, bypassable; re-run after editing .githooks/pre-commit)
+hooks:
+    install -m 755 .githooks/pre-commit "$(git rev-parse --git-common-dir)/hooks/pre-commit"
+
+# Full secret scan: git history, then the working tree minus sibling worktrees (run by hand)
+secret-scan:
+    gitleaks git --redact --verbose --no-banner .
+    gitleaks dir --redact --verbose --no-banner -c .githooks/gitleaks-tree.toml .

@@ -1,0 +1,10 @@
+# Used only by `just secret-scan`'s tree half (explicit -c; not auto-loaded, so
+# the pre-commit hook and the history scan run on the default rules alone).
+# Sibling agent worktrees live under .claude/worktrees/ and are other checkouts,
+# not this tree; scanning them yields false hits.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "sibling agent worktrees"
+paths = ['''^\.claude/worktrees/''']
