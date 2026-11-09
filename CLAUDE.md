@@ -5,7 +5,7 @@ agent runs reach GitHub without a human unlocking the 1Password desktop app. Bui
 reviewed, shipped, and in daily use since. Home: `github.com/prmanahan/sigil`. Licensed Apache-2.0
 (`LICENSE`).
 
-Single flat Go package, 23 Go files, ~5.3k lines.
+Single flat Go package, 24 Go files, ~5.5k lines.
 
 ## Read this before treating anything here as settled
 
@@ -27,11 +27,14 @@ Flat `package main` at the repo root. No `cmd/`, no `internal/`, no subpackages.
 | `token_narrow.go` | `sigil token --rate-limit-only`: the fixed-body (`{"permissions":{"metadata":"read"},"repositories":[repo]}`) access_tokens POST, `verifyNarrowedGrant`'s exact-match check against GitHub's actual response, and revoke-on-mismatch. Sibling to `token.go`/`exchange.go` — never imports `cache.go` |
 | `cache.go` | On-disk token cache, `0600`-enforced. Only `token.go`'s full-permission path reads/writes it |
 | `*_test.go` | Tests. `credential_channel_test.go` pins the stdout/stderr channel separation of `writeCredentialResponse`; `parse_key_test.go` covers `parseRSAPrivateKey`; `lazy_key_test.go` and `cli_cache_test.go` pin the routing → cache → key-read order |
-| `justfile` | `build` · `test` · `vet` · `fmt` · `fmt-check` · `check`. ⚠ **No `install` recipe** |
+| `justfile` | `build` · `test` · `vet` · `fmt` · `fmt-check` · `check` · `hooks` (installs a COPY of the pre-commit hook into the clone's git hooks dir) · `secret-scan` (full history and tree scan). Neither `hooks` nor `secret-scan` is part of `check`. ⚠ **No `install` recipe** |
 | `config.example.toml` | The template. Non-secret fields only; its comments carry the secret-boundary rationale |
 | `testdata/*.toml` | Three config fixtures: valid, malformed, and no-installations |
 | `LICENSE` | Apache-2.0, unmodified text, no NOTICE file |
-| `.gitleaksignore` | One entry: a known false positive on a test fixture string. Together with the inline `// gitleaks:allow` on the same fixture in `token_narrow_test.go`, it configures a secret scan (`gitleaks git` for history, `gitleaks dir` for the tree) that is **run by hand**; no hook, recipe or CI job runs it. Keep both; do not widen either |
+| `.gitleaksignore` | One entry: a known false positive on a test fixture string. Together with the inline `// gitleaks:allow` on the same fixture in `token_narrow_test.go`, it configures the secret scan, which two things run: the `.githooks/pre-commit` hook (`gitleaks git --staged`) and `just secret-scan` (`gitleaks git` for history, then `gitleaks dir` for the tree, **run by hand**). No CI job runs it. Keep both; do not widen either. ⚠ **The `.gitleaksignore` entry is commit-keyed**, so it suppresses only the history scan; the inline `gitleaks:allow` is what covers the staged and tree scans. Measured: the tree scan with `--ignore-gitleaks-allow` reports 1 finding despite the entry (the staged case is inferred from the entry's commit-keyed form, not run) |
+| `.githooks/pre-commit` | Secret scan of the staged change, failing closed: an unreadable staged set (a plain `git diff --cached` preflight), a missing `gitleaks`, a scan error, a finding, **or an `ERR`-level line on gitleaks' stderr even at exit 0** all refuse the commit; only exit 0 and no `ERR` line passes. ⛔ **The stderr check is load-bearing — do not remove it as redundant.** gitleaks 8.30.1 logs a failure of its own git step (measured: `GIT_INDEX_FILE=/dev/null`) at `ERR` and still exits 0 with `no leaks found`, so its exit status alone reads an unscanned change as clean. ⚠ **Per-clone and locally bypassable, and `git commit` only** — `just hooks` installs a *copy* into the clone's git hooks dir (never committed, so it does not travel with a clone), a later edit to `.githooks/pre-commit` needs a re-run, and `git commit --no-verify` skips it. A velocity aid, not a boundary; no server-side or CI layer backs it. Needs `gitleaks` on `PATH` (8.30.1 measured). `precommit_hook_test.go` pins the decision logic with stub `git`/`gitleaks` in the default gate; it does not run a real gitleaks |
+| `.githooks/gitleaks-tree.toml` | Config for `just secret-scan`'s tree half only (explicit `-c`, never auto-loaded): default rules plus an allowlist of `^\.claude/worktrees/` so sibling worktrees do not produce false hits. Deliberately not a root `.gitleaks.toml`, which gitleaks would load for every scan, the hook included |
+| **Control surfaces** | `.githooks/`, `.githooks/gitleaks-tree.toml` and `.gitleaksignore` decide what the secret scan sees or suppresses. A change to any of them is a change to a control: review it as one, and widen narrowly (never disable) |
 
 ⚠ **`unexported` buys nothing here.** One package, no import boundary — every identifier is
 reachable from every file. Invariants that read as "enclosed" are enclosed by *convention*.
@@ -48,11 +51,11 @@ just check
 
 Chains `vet` → `fmt-check` → `test` (`go vet ./...`, `test -z "$(gofmt -l .)"`,
 `go test ./...`). **Measured 2026-11-09 after `go clean -testcache`: all green, exit 0, ~11 s
-cold. 110 top-level tests pass, 2 skip, 0 fail.**
+cold. 113 top-level tests pass, 2 skip, 0 fail.**
 ⚠ **State the counting method, because it has already drifted once**: this number is
 top-level only — `go test -count=1 -v ./...` then `grep -c '^--- PASS'` and `'^--- SKIP'`,
-which counts neither subtests nor `TestMain`. The tree holds 113 `func Test`; one is `TestMain`,
-leaving 112 top-level tests = 110 pass + 2 skip.
+which counts neither subtests nor `TestMain`. The tree holds 116 `func Test`; one is `TestMain`,
+leaving 115 top-level tests = 113 pass + 2 skip.
 ⛔ **The skip count is 2 on macOS, gated on `OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`**,
 and the two skipped tests below remain the only coverage of the happy path and the end-to-end
 stderr leak scan. ⚠ **Those two are the only skips measured, and they are not the only ones
@@ -139,8 +142,9 @@ accrues advisories with nothing watching.
 - ⛔ **No branch protection is configured here.** Nothing server-side stops a direct push to
   `main` or a merge commit. Check the repository's current settings rather than assuming.
 - ⛔ **There is no `.github/` directory. A PR here runs NOTHING** — no workflow, no check, no
-  server-side gate. A PR is a review surface, not a gate. ⇒ **A local `just check` is the entire
-  verification layer, and it is the layer the actor being constrained can skip.** Do not let a
+  server-side gate. A PR is a review surface, not a gate. ⇒ **A local `just check` and the per-clone pre-commit secret-scan hook are the entire
+  verification layer, and both are layers the actor being constrained can skip** (the hook with
+  `--no-verify` or by never installing it). Do not let a
   green PR imply anything was verified.
 - **Land via PR**: squash to one delivery commit, push to `origin`, open the PR,
   rebase-and-merge, then fast-forward local `main` **from the remote** — never advance it

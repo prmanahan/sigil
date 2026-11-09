@@ -1,0 +1,58 @@
+#!/bin/sh
+# Secret scan of the staged change. Fails closed: the commit proceeds only
+# when the staged set was readable, gitleaks ran, exited 0 AND logged no ERR
+# line on stderr. A missing binary, an unreadable index, a scan error, a
+# finding and an ERR line each refuse.
+#
+# Why stderr is read: gitleaks 8.30.1 logs a failure of its own git step
+# (e.g. an unreadable index) at ERR level and still exits 0 with "no leaks
+# found". Its exit status alone cannot be trusted as "scanned". Do not remove
+# the stderr check as redundant.
+#
+# Per-clone (`just hooks` installs a copy into the git hooks dir, so an edit
+# here needs a re-run), covers `git commit` only, and bypassable with
+# --no-verify: a velocity aid, not a boundary.
+set -u
+
+refuse_scan() {
+    echo "pre-commit: REFUSED - gitleaks failed to scan ($1); an unscanned change is not a clean one." >&2
+    exit 1
+}
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: REFUSED - gitleaks not found on PATH; cannot scan the staged change." >&2
+    echo "pre-commit: install gitleaks, then retry." >&2
+    exit 1
+fi
+
+# Plain read of the staged set: if git cannot produce it, nothing was scanned.
+if ! git diff --cached --name-only >/dev/null; then
+    echo "pre-commit: REFUSED - git could not read the staged set (output above); an unscanned change is not a clean one." >&2
+    exit 1
+fi
+
+# --exit-code 42 separates "found a secret" from any other failure (which
+# gitleaks reports as 1). stdout (the redacted findings) passes straight
+# through on fd 3; stderr is captured to be inspected, then shown.
+# --no-color is what keeps the ERR match below working: measured on gitleaks
+# 8.30.1, it colours the level token even when stderr is a pipe, as ESC[31mERR
+# ESC[0m, which the whitespace-delimited match does not see. Do not drop it.
+exec 3>&1
+err=$(gitleaks git --staged --redact --verbose --no-banner --no-color --exit-code 42 2>&1 1>&3 3>&-)
+rc=$?
+exec 3>&-
+if [ -n "$err" ]; then
+    printf '%s\n' "$err" >&2
+fi
+
+case "$rc" in
+    0) ;;
+    42) echo "pre-commit: REFUSED - gitleaks found a secret in the staged change (output above, redacted)." >&2; exit 1 ;;
+    *) refuse_scan "exit $rc" ;;
+esac
+
+# Exit 0 is not enough: an ERR-level log line means the scan did not complete.
+case "$err" in
+    *[[:space:]]ERR[[:space:]]*|ERR[[:space:]]*) refuse_scan "ERR line on stderr despite exit 0" ;;
+esac
+exit 0
