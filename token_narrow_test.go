@@ -1,6 +1,6 @@
 package main
 
-// #3647: unit and httptest-level coverage for the --rate-limit-only path.
+// Unit and httptest-level coverage for the --rate-limit-only path.
 // None of these tests need network or 1Password — GitHub is always an
 // httptest mock here, matching exchange_test.go / token_test.go's convention.
 
@@ -21,7 +21,7 @@ import (
 // --- parseOwnerRepo: argument-shape unit tests ---
 
 // TestParseOwnerRepo_Table covers the accepted shape and every rejected shape
-// #3647 names: a/b/c (too many slashes), /repo and owner/ (empty side), and
+// the spec named: a/b/c (too many slashes), /repo and owner/ (empty side), and
 // no slash at all.
 func TestParseOwnerRepo_Table(t *testing.T) {
 	tests := []struct {
@@ -63,8 +63,8 @@ func TestParseOwnerRepo_Table(t *testing.T) {
 // or config-load side effects of the cmd* functions themselves — that
 // end-to-end property is covered separately at the CLI level in cli_test.go.
 
-// TestDispatchToken_RejectsBeforeDelegating verifies every #3647-named
-// rejected shape returns an error without needing a config or network mock —
+// TestDispatchToken_RejectsBeforeDelegating verifies every rejected
+// shape returns an error without needing a config or network mock —
 // i.e. the rejection happens in argument parsing, not downstream.
 func TestDispatchToken_RejectsBeforeDelegating(t *testing.T) {
 	tests := []struct {
@@ -94,8 +94,8 @@ func TestDispatchToken_RejectsBeforeDelegating(t *testing.T) {
 }
 
 // --- verifyNarrowedGrant: grant-check unit tests ---
-// Response shapes below mirror #3647's live measurement (Peter's run,
-// 2026-09-17, mnemra installation 143101545): an access_tokens request body
+// Response shapes below mirror a live measurement (the maintainer's run,
+// 2026-09-17, against a live installation): an access_tokens request body
 // of {"permissions":{}} was granted all seven installation permissions
 // including write, not none, and a request body of
 // {"permissions":{"metadata":"read"},"repositories":[]} was granted
@@ -401,16 +401,15 @@ func TestGetRateLimitOnlyToken_RevokeFailureStillErrors(t *testing.T) {
 	}
 }
 
-// TestGetRateLimitOnlyToken_401RetryStillVerifiesGrant verifies #3647 Warden
-// finding #1 (MEDIUM, reproduced): nothing previously exercised the 401
-// re-mint-and-retry path far enough to prove the *retried* response is still
-// run through verifyNarrowedGrant rather than trusted outright. Mirrors
+// TestGetRateLimitOnlyToken_401RetryStillVerifiesGrant verifies that the 401
+// re-mint-and-retry path runs the *retried* response through
+// verifyNarrowedGrant rather than trusting it outright. Mirrors
 // TestGetInstallationToken_401TriggersRemint's shape (token_test.go): 401 on
 // the first mint, then 201 on the retry — except the retried grant here is a
 // full-access widen, so the correct behaviour is still an error, not a token.
 func TestGetRateLimitOnlyToken_401RetryStillVerifiesGrant(t *testing.T) {
 	const installID = int64(12345)
-	const retriedToken = "ghs_widened_after_401_retry"
+	const retriedToken = "ghs_widened_after_401_retry" // gitleaks:allow
 
 	cfg := newTestConfig(installID)
 	key := newTestKey(t)
@@ -468,10 +467,9 @@ func TestGetRateLimitOnlyToken_401RetryStillVerifiesGrant(t *testing.T) {
 	}
 }
 
-// TestGetRateLimitOnlyToken_EmptyTokenFailsClosed verifies #3647 Warden
-// finding #4 (MEDIUM): a 201 with an otherwise-correct grant but an empty
-// token must not pass through — cmdTokenNarrowed would otherwise print a
-// blank line to stdout with exit 0.
+// TestGetRateLimitOnlyToken_EmptyTokenFailsClosed verifies that a 201
+// with an otherwise-correct grant but an empty token must not pass through:
+// cmdTokenNarrowed would otherwise print a blank line to stdout with exit 0.
 func TestGetRateLimitOnlyToken_EmptyTokenFailsClosed(t *testing.T) {
 	const installID = int64(12345)
 	const repo = "mnemra-core"
@@ -502,8 +500,8 @@ func TestGetRateLimitOnlyToken_EmptyTokenFailsClosed(t *testing.T) {
 }
 
 // TestRevokeNarrowedToken_SurvivesAlreadyCancelledContext and
-// TestRevokeNarrowedToken_SurvivesExpiredDeadlineContext verify #3647 Warden
-// finding #3 (MEDIUM): the revoke leg has its own 5s budget, detached from
+// TestRevokeNarrowedToken_SurvivesExpiredDeadlineContext verify that
+// the revoke leg has its own 5s budget, detached from
 // the caller's ctx — a cancelled or already-expired parent must not stop the
 // DELETE from reaching the network, since a mismatch discovered right at the
 // caller's deadline is exactly when the widened token most needs revoking.
@@ -554,7 +552,7 @@ func TestRevokeNarrowedToken_SurvivesExpiredDeadlineContext(t *testing.T) {
 	}
 }
 
-// TestGetRateLimitOnlyToken_CacheIsolation verifies #3647's cache-isolation
+// TestGetRateLimitOnlyToken_CacheIsolation verifies the cache-isolation
 // requirement. getRateLimitOnlyToken's signature (ctx, cfg, key, owner, repo,
 // apiBaseURL) has no cacheDir parameter, so it cannot call cacheGet/cachePut
 // against a directory it was never given — but that alone would make a test

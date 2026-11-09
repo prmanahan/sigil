@@ -1,6 +1,6 @@
 package main
 
-// AC#2: Routing: a given path selects the correct installation id; unknown owner → error.
+// Routing: a given path selects the correct installation id; unknown owner → error.
 //
 // White-box unit tests for resolveInstallation, which extracts the repo owner from the
 // git credential `path` field (first "/" segment) and looks it up in the installations map.
@@ -138,10 +138,9 @@ func TestResolveInstallation_EmptyPathFailsClosed(t *testing.T) {
 // TestResolveInstallation_LeadingSlashEmptyOwner verifies that a path beginning
 // with "/" (e.g. "/owner/repo") extracts an empty owner string and fails closed.
 //
-// N3a status: GREEN with current implementation. When repoPath="/owner/repo",
-// strings.IndexByte finds "/" at index 0, so owner = repoPath[:0] = "". The
-// empty string is not in any installations map → error. This test documents and
-// pins the fail-closed behaviour for this edge case.
+// When repoPath="/owner/repo", strings.IndexByte finds "/" at index 0, so
+// owner = repoPath[:0] = "". The empty string is not in any installations
+// map → error. This test pins the fail-closed behaviour for this edge case.
 func TestResolveInstallation_LeadingSlashEmptyOwner(t *testing.T) {
 	// Given: a config that knows about "owner" by its bare name (no leading slash).
 	cfg := &Config{

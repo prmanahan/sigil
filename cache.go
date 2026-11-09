@@ -28,7 +28,8 @@ func cacheFilePath(cacheDir string, installID int64) string {
 }
 
 // cacheGet returns the CachedToken for installID, or nil if the file does not
-// exist or the token is expired. A missing file is not an error.
+// exist, the token is expired, or the entry holds no token. A missing file is
+// not an error.
 func cacheGet(cacheDir string, installID int64) (*CachedToken, error) {
 	path := cacheFilePath(cacheDir, installID)
 
@@ -49,6 +50,12 @@ func cacheGet(cacheDir string, installID int64) (*CachedToken, error) {
 	}
 
 	if ct.Expiry.Before(time.Now()) {
+		return nil, nil
+	}
+
+	// An entry with no token is never a credential: serving it would emit an
+	// empty password with exit 0. Treat it as a miss so the caller re-mints.
+	if ct.Token == "" {
 		return nil, nil
 	}
 

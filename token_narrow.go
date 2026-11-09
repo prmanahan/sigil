@@ -3,13 +3,13 @@ package main
 // token_narrow.go — getRateLimitOnlyToken mints a "rate-limit-only" installation
 // token: permissions narrowed to metadata:read, scoped to exactly one repository.
 //
-// Sibling to token.go's getInstallationToken, not a variant of it: this path
-// never calls cacheGet or cachePut. #3647's measurement is why — a token this
+// Sibling to token.go's getInstallationTokenLazy, not a variant of it: this path
+// never calls cacheGet or cachePut. A live measurement is why — a token this
 // narrow is a one-shot credential for a single unattended rate-limit bump, not
 // a long-lived one worth persisting, and caching it would need a second cache
 // key (installID alone collides with the full-permission cache entry).
 //
-// #3647 also measured that GitHub's grant does not always match the request:
+// That measurement also showed that GitHub's grant does not always match the request:
 // an empty `permissions: {}` body was granted all seven installation
 // permissions including write, and an empty `repositories: []` body reverted
 // `repository_selection` to "all". verifyNarrowedGrant exists to catch exactly
@@ -73,7 +73,7 @@ func getRateLimitOnlyToken(ctx context.Context, cfg *Config, key *rsa.PrivateKey
 		if !errors.Is(err, errUnauthorized) {
 			return "", fmt.Errorf("getRateLimitOnlyToken: exchange: %w", err)
 		}
-		// Mirrors getInstallationToken's re-mint-on-401 retry: a JWT can be
+		// Mirrors getInstallationTokenLazy's re-mint-on-401 retry: a JWT can be
 		// rejected as stale for the same reasons on either path.
 		appJWT, err = mintAppJWT(key, cfg.AppID, time.Now())
 		if err != nil {
@@ -85,7 +85,7 @@ func getRateLimitOnlyToken(ctx context.Context, cfg *Config, key *rsa.PrivateKey
 		}
 	}
 
-	// Warden review (#3647): checked before the grant match, not after — a
+	// Checked before the grant match, not after — a
 	// 201 with an empty token is never revocable (an empty bearer credential
 	// is not a live grant to undo) regardless of whether the grant would
 	// otherwise have matched, so there is nothing the mismatch branch below
@@ -154,7 +154,7 @@ func exchangeNarrowedToken(ctx context.Context, apiBaseURL, appJWT string, insta
 }
 
 // permissionKeysSorted returns the sorted key names of a permissions map, for
-// error messages. Warden review (#3647): reporting the raw map via %v put the
+// error messages. Reporting the raw map via %v would put the
 // installation's actual granted permission *levels* (read/write/admin) on
 // stderr, against this file's own "types, status codes and lengths — never
 // bytes" convention. Key names alone are enough to diagnose a mismatch
@@ -169,8 +169,10 @@ func permissionKeysSorted(perms map[string]string) []string {
 }
 
 // verifyNarrowedGrant checks GitHub's actual grant against the exact request
-// that was made — all four conditions ANDed, exact match, never inferred.
-// #3647 measured that permissions["metadata"]=="read" alone is not sufficient:
+// that was made — all five conditions ANDed, exact match, never inferred: the
+// permission set, repository_selection, the repository count, the repository
+// name, and a refusal of a private repository.
+// A live measurement showed that permissions["metadata"]=="read" alone is not sufficient:
 // it also holds for a full-access grant that additionally includes write.
 func verifyNarrowedGrant(resp *narrowedTokenResponse, repo string) error {
 	if len(resp.Permissions) != 1 || resp.Permissions["metadata"] != "read" {
@@ -198,7 +200,7 @@ func verifyNarrowedGrant(resp *narrowedTokenResponse, repo string) error {
 // never the token.
 //
 // Runs on its own 5s budget, detached from the caller's cancellation and
-// deadline (Warden review, #3647): the caller's ctx may already be cancelled
+// deadline: the caller's ctx may already be cancelled
 // or past its deadline by the time a grant mismatch is discovered — e.g. the
 // mint plus one 401 retry burned the full 30s budget — and that is exactly
 // when a widened token most needs revoking, not when the revoke should be

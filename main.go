@@ -7,14 +7,14 @@ package main
 //   sigil store                             — no-op (git protocol requirement), exit 0
 //   sigil erase                             — no-op (git protocol requirement), exit 0
 //   sigil token <owner>                     — mint and print a full-permission installation
-//                                              token to stdout (cached; unchanged since #1880).
+//                                              token to stdout (cached).
 //                                              Refuses to run when stdout is not a terminal
-//                                              (#3667) — see requireTerminalStdout
+//                                              — see requireTerminalStdout
 //   sigil token --rate-limit-only <owner>/<repo>
 //                                            — mint and print a token narrowed to
 //                                              metadata:read on exactly one repo; verified
 //                                              against GitHub's actual grant before being
-//                                              trusted or printed; never cached (#3647)
+//                                              trusted or printed; never cached
 //   sigil doctor                            — verify config + key + one mint; print safe summary
 //
 // Security invariants:
@@ -30,9 +30,9 @@ package main
 //     mismatch revokes the token and returns an error instead. Never cached: it is a
 //     one-shot credential, not a long-lived one. ⇒ Breaking the verification lets a
 //     silently-widened grant (e.g. an empty permissions object granting everything,
-//     write included — measured #3647) reach stdout unnoticed.
+//     write included — measured against a live installation) reach stdout unnoticed.
 //   - Full-permission token (sigil token <owner>): refused when stdout is not a
-//     terminal, before the key read and before any network call (#3667). This is a
+//     terminal, before the key read and before any network call. This is a
 //     speed bump and not a boundary — a pty defeats it, and `sigil get` plus the
 //     on-disk cache sit outside it entirely — so it narrows the ordinary
 //     unattended case and does not replace the agent permission rule. The honest
@@ -105,14 +105,9 @@ func cmdGet() error {
 		return err
 	}
 
-	// L1: validate API base URL scheme before any credential read (fail closed,
+	// Validate API base URL scheme before any credential read (fail closed,
 	// no credentials required to detect a misconfiguration).
 	if err := validateAPIBase(apiBase()); err != nil {
-		return err
-	}
-
-	key, err := readKey(cfg.OPKeyRef)
-	if err != nil {
 		return err
 	}
 
@@ -121,11 +116,16 @@ func cmdGet() error {
 		return err
 	}
 
-	// M1: bounded context prevents an unbounded hang on an unresponsive API.
+	// One deadline bounds the 1Password network waits and the API exchange, and a
+	// slow key read spends part of the same 30 s budget. It does not interrupt the
+	// WASM core load or guest compute: onepassword-sdk-go v0.4.0 sets no manifest
+	// timeout and GetExtismCore runs under context.Background().
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	token, err := getInstallationToken(ctx, cfg, key, attrs["path"], apiBase(), cacheDir)
+	// Routing and the cache lookup run before the key is read, so a cache hit or
+	// an unknown owner never touches 1Password.
+	token, err := getInstallationTokenLazy(ctx, cfg, func(ctx context.Context) (*rsa.PrivateKey, error) { return readKey(ctx, cfg.OPKeyRef) }, attrs["path"], apiBase(), cacheDir)
 	if err != nil {
 		return err
 	}
@@ -136,24 +136,24 @@ func cmdGet() error {
 }
 
 // cmdToken mints and prints an installation token to stdout for the given owner.
-// Intended for the per-run URL-rewrite fallback and debugging.
+// Interactive use only (see requireTerminalStdout).
 func cmdToken(owner string) error {
 	cfg, err := loadConfigDefault()
 	if err != nil {
 		return err
 	}
 
-	// L1: validate API base URL scheme before any credential read (fail closed,
+	// Validate API base URL scheme before any credential read (fail closed,
 	// no credentials required to detect a misconfiguration).
 	if err := validateAPIBase(apiBase()); err != nil {
 		return err
 	}
 
-	// #3667: this form mints a FULL-PERMISSION token, so it runs interactively
+	// This form mints a FULL-PERMISSION token, so it runs interactively
 	// only. The check sits in the credential-free preflight band — after the
-	// scheme check, before readKey — so a refused run reads no secret and makes
-	// no network call. Ordered after the scheme check deliberately: a
-	// misconfigured API base is an operator-facing defect that should surface
+	// scheme check, before routing, the cache and the key read — so a refused run
+	// reads no secret and makes no network call. Ordered after the scheme check
+	// deliberately: a misconfigured API base is an operator-facing defect that should surface
 	// whether or not stdout is a terminal.
 	//
 	// Only this path is gated. cmdGet is driven by git over pipes and is non-tty
@@ -162,21 +162,17 @@ func cmdToken(owner string) error {
 		return err
 	}
 
-	key, err := readKey(cfg.OPKeyRef)
-	if err != nil {
-		return err
-	}
-
 	cacheDir := defaultCacheDir()
 	if err := ensureCacheDir(cacheDir); err != nil {
 		return err
 	}
 
-	// M1: bounded context prevents an unbounded hang on an unresponsive API.
+	// One bounded context covers the key read and the API exchange (see cmdGet).
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	token, err := getInstallationToken(ctx, cfg, key, owner, apiBase(), cacheDir)
+	// Routing and the cache lookup run before the key is read (see cmdGet).
+	token, err := getInstallationTokenLazy(ctx, cfg, func(ctx context.Context) (*rsa.PrivateKey, error) { return readKey(ctx, cfg.OPKeyRef) }, owner, apiBase(), cacheDir)
 	if err != nil {
 		return err
 	}
@@ -202,7 +198,7 @@ const rateLimitOnlyFlag = "--rate-limit-only"
 // and taking the last element: that shape would let a typo'd or misplaced flag
 // (e.g. --rate-limt-only, or the flag placed after the positional) silently fall
 // through to a full-permission mint — the same class of silent widening
-// verifyNarrowedGrant guards against on GitHub's side (#3647: an empty
+// verifyNarrowedGrant guards against on GitHub's side (an empty
 // permissions object in the request was granted every installation
 // permission, write included), moved into this parser instead.
 func dispatchToken(args []string) error {
@@ -258,20 +254,29 @@ func cmdTokenNarrowed(owner, repo string) error {
 		return err
 	}
 
-	// L1: validate API base URL scheme before any credential read (fail closed,
+	// Validate API base URL scheme before any credential read (fail closed,
 	// no credentials required to detect a misconfiguration).
 	if err := validateAPIBase(apiBase()); err != nil {
 		return err
 	}
 
-	key, err := readKey(cfg.OPKeyRef)
-	if err != nil {
+	// Route before reading the key: an unknown owner must fail with the routing
+	// error and never touch 1Password. Unlike getInstallationTokenLazy, this path
+	// takes an already-loaded key (getRateLimitOnlyToken routes again itself and
+	// its tests pass a key directly), so the result here is discarded and only
+	// the ordering matters; routing is a pure map lookup, so doing it twice is free.
+	if _, err := resolveInstallation(cfg, owner); err != nil {
 		return err
 	}
 
-	// M1: bounded context prevents an unbounded hang on an unresponsive API.
+	// One bounded context covers the key read and the API exchange.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	key, err := readKey(ctx, cfg.OPKeyRef)
+	if err != nil {
+		return err
+	}
 
 	token, err := getRateLimitOnlyToken(ctx, cfg, key, owner, repo, apiBase())
 	if err != nil {
@@ -298,7 +303,10 @@ func cmdDoctor() error {
 	}
 	fmt.Fprintln(os.Stderr, "OP_SERVICE_ACCOUNT_TOKEN: present")
 
-	key, err := readKey(cfg.OPKeyRef)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	key, err := readKey(ctx, cfg.OPKeyRef)
 	if err != nil {
 		return fmt.Errorf("key read: %w", err)
 	}
@@ -330,14 +338,16 @@ func loadConfigDefault() (*Config, error) {
 // readKey reads the RSA private key from 1Password using the service-account token
 // from the environment. Fails closed if OP_SERVICE_ACCOUNT_TOKEN is absent.
 // The key is never written to disk; it is held in memory for the duration of the call.
-func readKey(opKeyRef string) (*rsa.PrivateKey, error) {
+// ctx bounds the client init and secret resolution network waits; it does not
+// interrupt the WASM core load or guest compute (see cmdGet).
+func readKey(ctx context.Context, opKeyRef string) (*rsa.PrivateKey, error) {
 	saToken := os.Getenv("OP_SERVICE_ACCOUNT_TOKEN")
 	if saToken == "" {
 		return nil, errors.New("OP_SERVICE_ACCOUNT_TOKEN is not set")
 	}
 
 	client, err := onepassword.NewClient(
-		context.Background(),
+		ctx,
 		onepassword.WithServiceAccountToken(saToken),
 		onepassword.WithIntegrationInfo("sigil", "v1.0.0"),
 	)
@@ -345,7 +355,7 @@ func readKey(opKeyRef string) (*rsa.PrivateKey, error) {
 		return nil, fmt.Errorf("1Password client init: %w", err)
 	}
 
-	secret, err := client.Secrets().Resolve(context.Background(), opKeyRef)
+	secret, err := client.Secrets().Resolve(ctx, opKeyRef)
 	if err != nil {
 		return nil, fmt.Errorf("resolve key ref: %w", err)
 	}
@@ -456,12 +466,12 @@ func validateAPIBase(rawURL string) error {
 // errStdoutNotTerminal is the refusal text for the full-permission token form.
 // It is a constant with no interpolation, and requireTerminalStdout runs before
 // the key read and before any network call — so there is no token, key or
-// response body in the process to quote even by accident (#3667 AC#3).
+// response body in the process to quote even by accident.
 const errStdoutNotTerminal = "stdout is not a terminal: `sigil token <owner>` mints a full-permission installation token and runs interactively only (unattended use: `sigil token --rate-limit-only <owner>/<repo>`)"
 
 // requireTerminalStdout permits f only when it is a character device, and
 // refuses everything else — pipes, regular files, sockets. Called from cmdToken
-// alone (#3667). No CONFIGURED bypass reaches this decision: no flag, no
+// alone. No CONFIGURED bypass reaches this decision: no flag, no
 // environment variable, nothing in config. That is a claim about this function
 // and nothing wider — the control has the bypasses enumerated below, and none
 // of them go through it.
@@ -481,14 +491,15 @@ const errStdoutNotTerminal = "stdout is not a terminal: `sigil token <owner>` mi
 //     printer, and is supposed to be. Fed `protocol=https`, `host=github.com`
 //     and `path=<owner>/<anything>` on stdin, it writes `password=<token>` to a
 //     pipe (cmdGet → writeCredentialResponse) — no pty, no prior git operation,
-//     no cache read, nothing this gate is anywhere near. resolveInstallation
-//     reads only the first path segment, so the repo half is arbitrary. #3667
-//     AC#5 mandates leaving it alone and it is the entire purpose of the binary,
-//     so this is neither a defect nor fixable here; #3673 is the filed follow-up
-//     to narrow the grant the helper requests. It is named because a reader who
+//     a warm cache not required (a cold one mints), nothing this gate is
+//     anywhere near. resolveInstallation reads only the first path segment, so
+//     the repo half is arbitrary. The
+//     helper must be left alone — it is the entire purpose of the binary — so
+//     this is neither a defect nor fixable here; narrowing the grant the helper
+//     requests is a known follow-up. It is named because a reader who
 //     sees only the gate will otherwise take the control for more than it is.
 //   - ⛔ A full-permission token is already ON DISK. cmdGet calls
-//     getInstallationToken with the same cacheDir, so every ordinary git
+//     getInstallationTokenLazy with the same cacheDir, so every ordinary git
 //     operation through the helper writes ~/.cache/sigil/<installID>.json —
 //     0600, owner-readable, live for up to ~55 minutes (cache.go; expiry is
 //     GitHub's minus five). Reading it needs no pty and no subcommand. This gate
@@ -508,7 +519,7 @@ const errStdoutNotTerminal = "stdout is not a terminal: `sigil token <owner>` mi
 //   - The character-device test is coarser than isatty(3): `/dev/null` is a
 //     character device, so `sigil token <owner> > /dev/null` is permitted where
 //     isatty(3) would refuse. ⚠ That run discards the PRINTED BYTES but NOT the
-//     token — the gate sits before the mint, and getInstallationToken calls
+//     token — the gate sits before the mint, and getInstallationTokenLazy calls
 //     cachePut (token.go) before cmdToken ever reaches fmt.Println, so the token
 //     lands in the cache file described two bullets up and is readable from
 //     there. `sigil token <owner> > /dev/null; cat ~/.cache/sigil/<id>.json` is
