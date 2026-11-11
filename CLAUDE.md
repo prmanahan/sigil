@@ -139,10 +139,21 @@ accrues advisories with nothing watching.
 
 - **`github.com/prmanahan/sigil`** is the home; default branch `main`. ⚠ **Whether a clone's
   `origin` is wired to reach it through Sigil is a per-clone question** — see *Remotes*, below.
-- ⛔ **No branch protection is configured here.** Nothing server-side stops a direct push to
-  `main` or a merge commit. Check the repository's current settings rather than assuming.
+- ⚠ **A ruleset, `protect-main` (id 27038849), is active on `main` — measured 2026-11-11.**
+  Rules: `deletion`, `non_fast_forward`, `required_linear_history`, and `pull_request` with
+  rebase-only merges, **0 required approvals** and `require_extra_approval_for_unattributed_changes:
+  true` (GitHub supplied that one; the seed does not carry it). No bypass actors
+  (`current_user_can_bypass: never`). ⇒ A direct push to `main`, a force-push, a deletion and a
+  merge commit are refused server-side; a change reaches `main` only through a PR, rebase-merged.
+  ⛔ **Zero approvals means whoever can push a branch and open a PR can merge it.** The ruleset
+  forces the PR path; it does not put a second person, or any check, on it. It is not review and
+  not verification — do not read "protected" as "reviewed".
+  ⛔ **Applied once, by hand, with the frozen `~/claude_workspace/scripts/repo-protect`. Nothing
+  detects drift** — a loosened or deleted ruleset reads as nothing until someone looks. The repo
+  standard that will own it is #4222, not built; until its check exists, re-read
+  `gh api repos/prmanahan/sigil/rulesets/27038849` rather than trusting this entry.
 - ⛔ **There is no `.github/` directory. A PR here runs NOTHING** — no workflow, no check, no
-  server-side gate. A PR is a review surface, not a gate. ⇒ **A local `just check` and the per-clone pre-commit secret-scan hook are the entire
+  status check required by the ruleset. A PR is the forced route, not a gate. ⇒ **A local `just check` and the per-clone pre-commit secret-scan hook are the entire
   verification layer, and both are layers the actor being constrained can skip** (the hook with
   `--no-verify` or by never installing it). Do not let a
   green PR imply anything was verified.
@@ -152,9 +163,13 @@ accrues advisories with nothing watching.
   chiefly the pinned rebase base and the branch-delete predicate — are yours to apply rather
   than automatic.
 - **Squash to one delivery commit carrying the task number** before landing.
-- ⚠ **`deleteBranchOnMerge` has been `false`.** Branches do not clean themselves up; delete them
-  explicitly. All three merge methods have been enabled at the repo level, so nothing stops a
-  merge commit but discipline. Re-check both settings before relying on them.
+- **Repo settings, measured 2026-11-11 (`gh api repos/prmanahan/sigil`):** `delete_branch_on_merge`
+  `true` (a merged PR's remote branch is deleted; local and worktree branches are still yours to
+  delete), `allow_auto_merge` `true`, `allow_update_branch` `true`; **only rebase merge is allowed**
+  (`allow_merge_commit` and `allow_squash_merge` `false`). Auto-merge with 0 approvals and no
+  required checks merges as soon as the PR is mergeable. `security_and_analysis`: secret scanning
+  and push protection `enabled`; non-provider patterns, validity checks and Dependabot security
+  updates `disabled`. These are settings, not committed files — they can change with no diff here.
 - **Work in a worktree**, never the main checkout.
 
 ## Install and runtime wiring
