@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 06:17 UTC: govulncheck sees new advisories on an unchanged tree.
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            just_target: x86_64-unknown-linux-musl
+            just_sha256: 409044617b6f06517c1035e55ca38c8c856ff8b650e41bc2aa1ef82d5903a23e
+          - os: macos-latest
+            just_target: aarch64-apple-darwin
+            just_sha256: 6574cea774ed4cae12e24b6aa11857de33e80dab4667cf628fd5840df96a2a9d
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Diverges from the sibling repos, which use extractions/setup-just: that action does not verify its download.
+      # Hashes are from casey/just 1.59.0 SHA256SUMS; a mismatch fails the step.
+      - name: Install just (verified)
+        env:
+          JUST_VERSION: 1.59.0
+          JUST_TARGET: ${{ matrix.just_target }}
+          JUST_SHA256: ${{ matrix.just_sha256 }}
+        run: |
+          asset="just-${JUST_VERSION}-${JUST_TARGET}.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/casey/just/releases/download/${JUST_VERSION}/${asset}"
+          echo "${JUST_SHA256}  ${RUNNER_TEMP}/${asset}" | shasum -a 256 -c -
+          mkdir -p "${RUNNER_TEMP}/just-bin"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/just-bin" just
+          echo "${RUNNER_TEMP}/just-bin" >> "${GITHUB_PATH}"
+
+      - name: Run the CI recipe
+        run: just ci

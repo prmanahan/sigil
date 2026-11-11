@@ -1,6 +1,6 @@
 module github.com/prmanahan/sigil
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/1password/onepassword-sdk-go v0.4.0

@@ -23,6 +23,11 @@ fmt-check:
 # Full verification — what dispatch `verify` names
 check: vet fmt-check test
 
+# What GitHub runs (.github/workflows/ci.yml): check, then govulncheck at a pinned version.
+# Run this before opening a PR.
+ci: check
+    go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
 # Install a COPY of the pre-commit secret scan into this clone's git hooks dir
 # (per-clone, bypassable; re-run after editing .githooks/pre-commit)
 hooks:
