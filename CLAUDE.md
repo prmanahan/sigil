@@ -27,14 +27,15 @@ Flat `package main` at the repo root. No `cmd/`, no `internal/`, no subpackages.
 | `token_narrow.go` | `sigil token --rate-limit-only`: the fixed-body (`{"permissions":{"metadata":"read"},"repositories":[repo]}`) access_tokens POST, `verifyNarrowedGrant`'s exact-match check against GitHub's actual response, and revoke-on-mismatch. Sibling to `token.go`/`exchange.go` — never imports `cache.go` |
 | `cache.go` | On-disk token cache, `0600`-enforced. Only `token.go`'s full-permission path reads/writes it |
 | `*_test.go` | Tests. `credential_channel_test.go` pins the stdout/stderr channel separation of `writeCredentialResponse`; `parse_key_test.go` covers `parseRSAPrivateKey`; `lazy_key_test.go` and `cli_cache_test.go` pin the routing → cache → key-read order |
-| `justfile` | `build` · `test` · `vet` · `fmt` · `fmt-check` · `check` · `hooks` (installs a COPY of the pre-commit hook into the clone's git hooks dir) · `secret-scan` (full history and tree scan). Neither `hooks` nor `secret-scan` is part of `check`. ⚠ **No `install` recipe** |
+| `justfile` | `build` · `test` · `vet` · `fmt` · `fmt-check` · `check` · `ci` (`check`, then `govulncheck` at a pinned version: exactly what GitHub CI runs, so run it before opening a PR) · `hooks` (installs a COPY of the pre-commit hook into the clone's git hooks dir) · `secret-scan` (full history and tree scan). Neither `hooks` nor `secret-scan` is part of `check` or `ci`. ⚠ **No `install` recipe** |
+| `.github/workflows/ci.yml` | The CI workflow: `pull_request`, `push` to `main` and a weekly `schedule`, `permissions: contents: read`, no secrets, a job timeout and a concurrency group. One job on `ubuntu-latest` and `macos-latest` that checks out, sets up Go from `go.mod`, installs `just` and runs `just ci`. `just` 1.59.0 is downloaded from its casey/just release by a plain `run:` step and checked against a SHA-256 committed in the workflow matrix (from the release's `SHA256SUMS`, cross-checked by hashing the downloaded asset); a mismatch fails the step. It is not `extractions/setup-just`, which sibling repos use, because that action does not verify its download; a `just` bump means re-reading both hashes. The only actions used are GitHub's own, `actions/checkout` and `actions/setup-go`, pinned to a full commit SHA with the tag in a comment; a bump re-reads the SHA from the action's repository. `.github/dependabot.yml` proposes weekly `github-actions` updates (not `gomod`). `govulncheck` is pinned in the `ci` recipe, so a bump is a justfile change |
 | `config.example.toml` | The template. Non-secret fields only; its comments carry the secret-boundary rationale |
 | `testdata/*.toml` | Three config fixtures: valid, malformed, and no-installations |
 | `LICENSE` | Apache-2.0, unmodified text, no NOTICE file |
-| `.gitleaksignore` | One entry: a known false positive on a test fixture string. Together with the inline `// gitleaks:allow` on the same fixture in `token_narrow_test.go`, it configures the secret scan, which two things run: the `.githooks/pre-commit` hook (`gitleaks git --staged`) and `just secret-scan` (`gitleaks git` for history, then `gitleaks dir` for the tree, **run by hand**). No CI job runs it. Keep both; do not widen either. ⚠ **The `.gitleaksignore` entry is commit-keyed**, so it suppresses only the history scan; the inline `gitleaks:allow` is what covers the staged and tree scans. Measured: the tree scan with `--ignore-gitleaks-allow` reports 1 finding despite the entry (the staged case is inferred from the entry's commit-keyed form, not run) |
-| `.githooks/pre-commit` | Secret scan of the staged change, failing closed: an unreadable staged set (a plain `git diff --cached` preflight), a missing `gitleaks`, a scan error, a finding, **or an `ERR`-level line on gitleaks' stderr even at exit 0** all refuse the commit; only exit 0 and no `ERR` line passes. ⛔ **The stderr check is load-bearing — do not remove it as redundant.** gitleaks 8.30.1 logs a failure of its own git step (measured: `GIT_INDEX_FILE=/dev/null`) at `ERR` and still exits 0 with `no leaks found`, so its exit status alone reads an unscanned change as clean. ⚠ **Per-clone and locally bypassable, and `git commit` only** — `just hooks` installs a *copy* into the clone's git hooks dir (never committed, so it does not travel with a clone), a later edit to `.githooks/pre-commit` needs a re-run, and `git commit --no-verify` skips it. A velocity aid, not a boundary; no server-side or CI layer backs it. Needs `gitleaks` on `PATH` (8.30.1 measured). `precommit_hook_test.go` pins the decision logic with stub `git`/`gitleaks` in the default gate; it does not run a real gitleaks |
+| `.gitleaksignore` | One entry: a known false positive on a test fixture string. Together with the inline `// gitleaks:allow` on the same fixture in `token_narrow_test.go`, it configures the secret scan, which two things run: the `.githooks/pre-commit` hook (`gitleaks git --staged`) and `just secret-scan` (`gitleaks git` for history, then `gitleaks dir` for the tree, **run by hand**). The CI workflow does not run it. Keep both; do not widen either. ⚠ **The `.gitleaksignore` entry is commit-keyed**, so it suppresses only the history scan; the inline `gitleaks:allow` is what covers the staged and tree scans. Measured: the tree scan with `--ignore-gitleaks-allow` reports 1 finding despite the entry (the staged case is inferred from the entry's commit-keyed form, not run) |
+| `.githooks/pre-commit` | Secret scan of the staged change, failing closed: an unreadable staged set (a plain `git diff --cached` preflight), a missing `gitleaks`, a scan error, a finding, **or an `ERR`-level line on gitleaks' stderr even at exit 0** all refuse the commit; only exit 0 and no `ERR` line passes. ⛔ **The stderr check is load-bearing — do not remove it as redundant.** gitleaks 8.30.1 logs a failure of its own git step (measured: `GIT_INDEX_FILE=/dev/null`) at `ERR` and still exits 0 with `no leaks found`, so its exit status alone reads an unscanned change as clean. ⚠ **Per-clone and locally bypassable, and `git commit` only** — `just hooks` installs a *copy* into the clone's git hooks dir (never committed, so it does not travel with a clone), a later edit to `.githooks/pre-commit` needs a re-run, and `git commit --no-verify` skips it. A velocity aid, not a boundary; CI does not run the scan, so no CI layer backs it. Needs `gitleaks` on `PATH` (8.30.1 measured). `precommit_hook_test.go` pins the decision logic with stub `git`/`gitleaks` in the default gate; it does not run a real gitleaks |
 | `.githooks/gitleaks-tree.toml` | Config for `just secret-scan`'s tree half only (explicit `-c`, never auto-loaded): default rules plus an allowlist of `^\.claude/worktrees/` so sibling worktrees do not produce false hits. Deliberately not a root `.gitleaks.toml`, which gitleaks would load for every scan, the hook included |
-| **Control surfaces** | `.githooks/`, `.githooks/gitleaks-tree.toml` and `.gitleaksignore` decide what the secret scan sees or suppresses. A change to any of them is a change to a control: review it as one, and widen narrowly (never disable) |
+| **Control surfaces** | `.githooks/`, `.githooks/gitleaks-tree.toml` and `.gitleaksignore` decide what the secret scan sees or suppresses; `.github/**`, the justfile's `ci`/`check`/`test`/`vet`/`fmt-check` recipes and the `go` line in `go.mod` decide what CI checks, because under `pull_request` a PR's own workflow and justfile define its check. A change to any of them is a change to a control: review it as one, and widen narrowly (never disable) |
 
 ⚠ **`unexported` buys nothing here.** One package, no import boundary — every identifier is
 reachable from every file. Invariants that read as "enclosed" are enclosed by *convention*.
@@ -56,6 +57,13 @@ cold. 113 top-level tests pass, 2 skip, 0 fail.**
 top-level only — `go test -count=1 -v ./...` then `grep -c '^--- PASS'` and `'^--- SKIP'`,
 which counts neither subtests nor `TestMain`. The tree holds 116 `func Test`; one is `TestMain`,
 leaving 115 top-level tests = 113 pass + 2 skip.
+**`just ci` is `check` plus `govulncheck`, and it is what GitHub runs** (`.github/workflows/ci.yml`, on
+`ubuntu-latest` and `macos-latest`); run it locally before opening a PR. ⚠ **Measured locally 2026-11-11, not yet on GitHub:**
+`just ci` on go directive 1.26.10, 14:52:55 to 14:53:04, exited 1 (govulncheck found GO-2026-6859, exit 3); at e99273b on
+go1.26.11 it exited 0 (14:54:44 to 14:54:59, "Your code is affected by 0 vulnerabilities"). It has not
+run on GitHub, and no run has yet been seen red there: a first green run does not show the gate can fail.
+The Linux job skips the pty CLI tests (they run only on darwin), so the macOS job is *expected* to be
+the one with pty coverage; that is not yet confirmed on a hosted runner.
 ⛔ **The skip count is 2 on macOS, gated on `OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`**,
 and the two skipped tests below remain the only coverage of the happy path and the end-to-end
 stderr leak scan. ⚠ **Those two are the only skips measured, and they are not the only ones
@@ -129,11 +137,21 @@ field-type landmine itself — a concealed field — only manifests there, and `
 error path can ever quote bytes; the stdlib's own error text for corrupt DER is asserted not to
 leak, not pinned.
 
-⛔ **`semgrep` and `govulncheck` are NOT in `just check` and nothing re-runs them.** `semgrep` was
-run once, at the original review, and CI was explicitly scoped out. `govulncheck` last ran clean
-(0 reachable vulnerabilities) on 2026-11-09, at Go directive 1.26.10. One direct
+⛔ **`semgrep` is NOT in `just check` or `just ci`, and nothing re-runs it.** It was run once, at the
+original review. `govulncheck` is not in `just check` but is in `just ci`, so CI runs it on every PR
+and every push to `main`; it last ran clean (0 reachable vulnerabilities) on 2026-11-09, at Go
+directive 1.26.10. `just ci` reported GO-2026-6859 against 1.26.10 (`just` exit 1);
+the directive is now 1.26.11 and `just ci` at e99273b exited 0 with 0 vulnerabilities (both runs
+local, 2026-11-11). **No GitHub run has confirmed it yet.** ⚠ **It also runs weekly** (Monday 06:17 UTC, a `schedule` trigger), so an
+advisory against an unchanged tree is seen within a week. Per GitHub's docs ("Notifications for scheduled workflows are
+sent to the user who last modified the cron syntax in the workflow file",
+`events-that-trigger-workflows.md` in `github/docs`), a red scheduled run notifies the user who last
+modified the cron line, subject to their notification settings. ⚠ If that commit lands through the App,
+no human may be notified (inferred, not measured). **Parked, human-noticed:** a red weekly run is
+seen only if someone looks at the Actions tab, cadence weekly. GitHub also disables scheduled workflows after 60 days without repository activity (GitHub's
+documented behaviour, not measured here). One direct
 dependency drags in a WASM runtime, a plugin framework and an OTLP/protobuf stack — that surface
-accrues advisories with nothing watching.
+accrues advisories between runs.
 
 ## Remote and merge posture (current, not aspirational)
 
@@ -152,11 +170,16 @@ accrues advisories with nothing watching.
   detects drift** — a loosened or deleted ruleset reads as nothing until someone looks. The repo
   standard that will own it is #4222, not built; until its check exists, re-read
   `gh api repos/prmanahan/sigil/rulesets/27038849` rather than trusting this entry.
-- ⛔ **There is no `.github/` directory. A PR here runs NOTHING** — no workflow, no check, no
-  status check required by the ruleset. A PR is the forced route, not a gate. ⇒ **A local `just check` and the per-clone pre-commit secret-scan hook are the entire
-  verification layer, and both are layers the actor being constrained can skip** (the hook with
-  `--no-verify` or by never installing it). Do not let a
-  green PR imply anything was verified.
+- ⛔ **A PR runs the `CI` workflow (`.github/workflows/ci.yml`), and the ruleset does NOT require it.**
+  CI runs `just ci` (`vet`, `fmt-check`, `test`, `govulncheck`) on `pull_request`, on `push` to
+  `main` and weekly. It does **not** run the 1Password-gated happy-path tests (no secrets there; both skip) and
+  does **not** run the secret scan. ⇒ **It is not yet a required check: `protect-main` has no
+  `required_status_checks` rule until the ruleset is changed, which waits for the workflow to have run
+  green.** A red run does not block a merge, and auto-merge does not wait for it. ⇒ **Until then the
+  local `just ci` and the per-clone pre-commit secret-scan hook remain layers the actor being
+  constrained can skip** (the hook with `--no-verify` or by never installing it; CI by merging
+  anyway). A PR is the forced route, not yet a gate. Do not let a green PR imply the happy path was
+  verified, or that a PR with no run was.
 - **Land via PR**: squash to one delivery commit, push to `origin`, open the PR,
   rebase-and-merge, then fast-forward local `main` **from the remote** — never advance it
   locally. The sequence above is executed by hand, so any guards a landing skill would carry —
@@ -387,8 +410,9 @@ Stated in `main.go`'s header comment. Each names what breaking it costs.
 - **28 MB binary, multi-second cold build.** The 1Password Go SDK is a WASM core, so the tree
   embeds a WASM runtime, the Extism plugin framework, and an OTLP/protobuf stack. Three direct
   dependencies, nine indirect.
-- **Go 1.26.10** in `go.mod` — a `go` directive, so a **minimum, not a pin**, raised from 1.26.4
-  to take the standard-library advisories fixed in 1.26.10. There is deliberately no `toolchain`
+- **Go 1.26.11** in `go.mod` — a `go` directive, so a **minimum, not a pin**, raised from 1.26.10
+  to take GO-2026-6859 (net/http, fixed in 1.26.11); before that, from 1.26.4 to take the
+  standard-library advisories fixed in 1.26.10. There is deliberately no `toolchain`
   line. **Measured 2026-11-09 with go1.26.10 darwin/arm64, in a throwaway module:** with
   `go 1.26.10` and `toolchain go1.26.10`, `go build` fails (`go: updates to go.mod needed; to
   update it: go mod tidy`) and `go mod tidy` removes the line; a `toolchain` line newer than the
