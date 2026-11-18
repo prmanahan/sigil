@@ -58,12 +58,18 @@ top-level only — `go test -count=1 -v ./...` then `grep -c '^--- PASS'` and `'
 which counts neither subtests nor `TestMain`. The tree holds 116 `func Test`; one is `TestMain`,
 leaving 115 top-level tests = 113 pass + 2 skip.
 **`just ci` is `check` plus `govulncheck`, and it is what GitHub runs** (`.github/workflows/ci.yml`, on
-`ubuntu-latest` and `macos-latest`); run it locally before opening a PR. ⚠ **Measured locally 2026-11-11, not yet on GitHub:**
+`ubuntu-latest` and `macos-latest`); run it locally before opening a PR. ⚠ **Measured locally 2026-11-11; GitHub runs since are listed below:**
 `just ci` on go directive 1.26.10, 14:52:55 to 14:53:04, exited 1 (govulncheck found GO-2026-6859, exit 3); at e99273b on
-go1.26.11 it exited 0 (14:54:44 to 14:54:59, "Your code is affected by 0 vulnerabilities"). It has not
-run on GitHub, and no run has yet been seen red there: a first green run does not show the gate can fail.
+go1.26.11 it exited 0 (14:54:44 to 14:54:59, "Your code is affected by 0 vulnerabilities").
+**Measured on GitHub 2026-11-18 (`gh run list --repo prmanahan/sigil --workflow CI`, `gh run view <id> --json jobs`):**
+both jobs (`ci (ubuntu-latest)`, `ci (macos-latest)`) passed on the 2026-11-11 `push` to `main`, the 2026-11-16 weekly
+`schedule` run, and PR #11 (2026-11-18, rebase-merged as 2fb8fac, both required checks green). The one red run, the
+2026-11-11 `pull_request` run on 0589b71, **predates the requirement** (ruleset version 57356339): ⚠ **no run has been
+seen red while the requirement was in force**, so that a red check blocks a merge rests on GitHub's documented
+behaviour, not on anything observed here.
 The Linux job skips the pty CLI tests (they run only on darwin), so the macOS job is *expected* to be
-the one with pty coverage; that is not yet confirmed on a hosted runner.
+the one with pty coverage; ⚠ **that is not confirmed on the hosted runner**: CI runs `go test` without `-v`, so the
+logs do not show a skip or a run.
 ⛔ **The skip count is 2 on macOS, gated on `OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`**,
 and the two skipped tests below remain the only coverage of the happy path and the end-to-end
 stderr leak scan. ⚠ **Those two are the only skips measured, and they are not the only ones
@@ -142,7 +148,7 @@ original review. `govulncheck` is not in `just check` but is in `just ci`, so CI
 and every push to `main`; it last ran clean (0 reachable vulnerabilities) on 2026-11-09, at Go
 directive 1.26.10. `just ci` reported GO-2026-6859 against 1.26.10 (`just` exit 1);
 the directive is now 1.26.11 and `just ci` at e99273b exited 0 with 0 vulnerabilities (both runs
-local, 2026-11-11). **No GitHub run has confirmed it yet.** ⚠ **It also runs weekly** (Monday 06:17 UTC, a `schedule` trigger), so an
+local, 2026-11-11). **GitHub has since run it green** (see above). ⚠ **It also runs weekly** (Monday 06:17 UTC, a `schedule` trigger), so an
 advisory against an unchanged tree is seen within a week. Per GitHub's docs ("Notifications for scheduled workflows are
 sent to the user who last modified the cron syntax in the workflow file",
 `events-that-trigger-workflows.md` in `github/docs`), a red scheduled run notifies the user who last
@@ -157,29 +163,36 @@ accrues advisories between runs.
 
 - **`github.com/prmanahan/sigil`** is the home; default branch `main`. ⚠ **Whether a clone's
   `origin` is wired to reach it through Sigil is a per-clone question** — see *Remotes*, below.
-- ⚠ **A ruleset, `protect-main` (id 27038849), is active on `main` — measured 2026-11-11.**
-  Rules: `deletion`, `non_fast_forward`, `required_linear_history`, and `pull_request` with
+- ⚠ **A ruleset, `protect-main` (id 27038849), is active on `main` — measured 2026-11-18.**
+  Rules: `deletion`, `non_fast_forward`, `required_linear_history`, `pull_request` with
   rebase-only merges, **0 required approvals** and `require_extra_approval_for_unattributed_changes:
-  true` (GitHub supplied that one; the seed does not carry it). No bypass actors
+  true` (GitHub supplied that one; the seed does not carry it), and `required_status_checks` requiring
+  `ci (ubuntu-latest)` and `ci (macos-latest)`, both `integration_id` 15368 (GitHub Actions),
+  `strict_required_status_checks_policy: false` (a branch need not be up to date with `main`) and
+  `do_not_enforce_on_create: false`. No bypass actors
   (`current_user_can_bypass: never`). ⇒ A direct push to `main`, a force-push, a deletion and a
-  merge commit are refused server-side; a change reaches `main` only through a PR, rebase-merged.
+  merge commit are refused server-side; a change reaches `main` only through a PR, rebase-merged, with both CI checks required.
   ⛔ **Zero approvals means whoever can push a branch and open a PR can merge it.** The ruleset
-  forces the PR path; it does not put a second person, or any check, on it. It is not review and
+  forces the PR path and requires CI, but puts no second person on it. It is not review and
   not verification — do not read "protected" as "reviewed".
-  ⛔ **Applied once, by hand, with the frozen `~/claude_workspace/scripts/repo-protect`. Nothing
+  ⛔ **Applied by hand with the frozen `~/claude_workspace/scripts/repo-protect`; the
+  `required_status_checks` rule was added afterwards, in ruleset version 57356339 (2026-11-11 15:17 -04:00),
+  by the prmanahan account (user id 395106). `gh api repos/prmanahan/sigil/rulesets/27038849/history` records the
+  actor and the time, not whether it was done through the UI, the API or a script. Nothing
   detects drift** — a loosened or deleted ruleset reads as nothing until someone looks. The repo
   standard that will own it is #4222, not built; until its check exists, re-read
   `gh api repos/prmanahan/sigil/rulesets/27038849` rather than trusting this entry.
-- ⛔ **A PR runs the `CI` workflow (`.github/workflows/ci.yml`), and the ruleset does NOT require it.**
+- ⛔ **A PR runs the `CI` workflow (`.github/workflows/ci.yml`), and the ruleset requires both of its jobs.**
   CI runs `just ci` (`vet`, `fmt-check`, `test`, `govulncheck`) on `pull_request`, on `push` to
   `main` and weekly. It does **not** run the 1Password-gated happy-path tests (no secrets there; both skip) and
-  does **not** run the secret scan. ⇒ **It is not yet a required check: `protect-main` has no
-  `required_status_checks` rule until the ruleset is changed, which waits for the workflow to have run
-  green.** A red run does not block a merge, and auto-merge does not wait for it. ⇒ **Until then the
-  local `just ci` and the per-clone pre-commit secret-scan hook remain layers the actor being
-  constrained can skip** (the hook with `--no-verify` or by never installing it; CI by merging
-  anyway). A PR is the forced route, not yet a gate. Do not let a green PR imply the happy path was
-  verified, or that a PR with no run was.
+  does **not** run the secret scan. ⇒ **A PR cannot merge on a red or missing `ci (ubuntu-latest)` or
+  `ci (macos-latest)`, and auto-merge waits for them** (GitHub's documented behaviour; ⚠ not observed
+  here, since no run has been seen red while the requirement was in force). ⛔ **"Required" is not "verified":** a
+  green PR means vet, format, the default test gate and `govulncheck` passed, never that the happy path
+  worked or that nothing secret was committed. ⇒ **The per-clone pre-commit secret-scan hook remains a
+  layer the actor being constrained can skip** (`--no-verify`, or never installing it), and no CI layer
+  backs it. The check is a gate on the PR route; it is still not review. Do not let a green PR imply the
+  happy path was verified.
 - **Land via PR**: squash to one delivery commit, push to `origin`, open the PR,
   rebase-and-merge, then fast-forward local `main` **from the remote** — never advance it
   locally. The sequence above is executed by hand, so any guards a landing skill would carry —
@@ -189,8 +202,8 @@ accrues advisories between runs.
 - **Repo settings, measured 2026-11-11 (`gh api repos/prmanahan/sigil`):** `delete_branch_on_merge`
   `true` (a merged PR's remote branch is deleted; local and worktree branches are still yours to
   delete), `allow_auto_merge` `true`, `allow_update_branch` `true`; **only rebase merge is allowed**
-  (`allow_merge_commit` and `allow_squash_merge` `false`). Auto-merge with 0 approvals and no
-  required checks merges as soon as the PR is mergeable. `security_and_analysis`: secret scanning
+  (`allow_merge_commit` and `allow_squash_merge` `false`). Auto-merge with 0 approvals merges once
+  the two required checks pass (GitHub's documented behaviour, not observed here). `security_and_analysis`: secret scanning
   and push protection `enabled`; non-provider patterns, validity checks and Dependabot security
   updates `disabled`. These are settings, not committed files — they can change with no diff here.
 - **Work in a worktree**, never the main checkout.
