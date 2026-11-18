@@ -18,7 +18,7 @@ I wanted a credential a process could use with nobody present, that kept working
 - It only answers for HTTPS to `github.com`. Any other host or protocol gets no output, so git moves on to its next helper, and that means GitHub Enterprise Server isn't supported.
 - It doesn't keep the credential away from other processes running as you. [What it protects and what it doesn't](#what-it-protects-and-what-it-doesnt) goes through that.
 - There's no prebuilt binary and you write a small wrapper yourself, so setup is twelve steps.
-- It has only been run on macOS. The only macOS-specific piece is the Keychain call in the wrapper.
+- It has only been used on macOS, though CI also runs the tests on Linux, where they pass with the two CLI tests that drive the binary under `script` skipped. The only macOS-specific piece is the Keychain call in the wrapper.
 
 ### Other tools
 
@@ -151,7 +151,7 @@ Sigil is in Go where I'd normally default to Rust. When I built it there was no 
 
 ## Setup
 
-You need a 1Password plan with service accounts and Go 1.26.10 or newer.
+You need a 1Password plan with service accounts and Go 1.26.11 or newer.
 
 1. **Register a GitHub App** on your account, with the webhook off. Set its visibility to *Any account* if it has to install anywhere other than the account that owns it, because a private App can only install there. Public controls who can discover and install the App, and it doesn't expose the key. Note the App ID, which isn't a secret.
 2. **Set its repository permissions** to what your automation needs and no more. That's what the App is granted, and git gets all of it.
@@ -225,7 +225,7 @@ just test      # tests only
 just build     # writes ./sigil
 ```
 
-The tests use Go's `testing` package with no assertion library, and `jwt_test.go` also uses `golang-jwt`. GitHub is mocked with `httptest` and RSA keypairs are generated in process. Two tests skip unless both `OP_SERVICE_ACCOUNT_TOKEN` and `SIGIL_TEST_OP_KEY_REF` are set, and they're the end-to-end path and the whole-binary check that a token doesn't reach stderr. The tests that allocate a pty also skip off macOS. The default run does check stderr on `sigil get`'s cache-hit path through the real binary, and on the one function that writes credentials, but a run without real 1Password credentials hasn't exercised a live mint. A GitHub workflow runs `just ci` (vet, format, tests and `govulncheck`) on pull requests and on pushes to `main`; the two 1Password-gated tests do not run there. Run `just ci` yourself before opening a PR. The secret scan is separate and optional. `just hooks` installs a copy of that scan, which needs `gitleaks` on your `PATH`, into your clone. It covers `git commit` only, `--no-verify` skips it, and it's a convenience, not a boundary. `just secret-scan` runs the full history and tree scan by hand.
+The tests use Go's `testing` package with no assertion library, and `jwt_test.go` also uses `golang-jwt`. GitHub is mocked with `httptest` and RSA keypairs are generated in process. Two tests skip unless both `OP_SERVICE_ACCOUNT_TOKEN` and `SIGIL_TEST_OP_KEY_REF` are set, and they're the end-to-end path and the whole-binary check that a token doesn't reach stderr. The two CLI tests that drive the binary under `script` also skip off macOS. The default run does check stderr on `sigil get`'s cache-hit path through the real binary, and on the one function that writes credentials, but a run without real 1Password credentials hasn't exercised a live mint. A GitHub workflow runs `just ci` (vet, format, tests and `govulncheck`) on pull requests, on pushes to `main` and once a week; the two 1Password-gated tests do not run there. Run `just ci` yourself before opening a PR. The secret scan is separate and optional. `just hooks` installs a copy of that scan, which needs `gitleaks` on your `PATH`, into your clone. It covers `git commit` only, `--no-verify` skips it, and it's a convenience, not a boundary. `just secret-scan` runs the full history and tree scan by hand.
 
 ## License
 
