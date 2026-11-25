@@ -19,7 +19,7 @@ This plan implements the locked spec `docs/specs/lead-session-gh-token.md`, pinn
 
 **Form.** Full form. Tasks are numbered `T<N>` and the plan's own decisions `D<N>`. `R-N` is the spec's requirement id. `FD-n`, `LT-n`, `KG-n`, `RR-n`, `DEF-1`, `ED-n` and `RISK-x` keep the Frame's meaning.
 
-**Upstream documents.** The spec adopts the Frame's lists "as written at" Frame lock commit `dd9ca140cab2818189d767e751d07fe47a788caf` (tag `brief/lead-session-gh-token/frame-locked`). That commit holds both `docs/intent/lead-session-gh-token-frame.md` and `docs/intent/lead-session-gh-token.md`. Read them there: `git show dd9ca140cab2818189d767e751d07fe47a788caf:docs/intent/lead-session-gh-token-frame.md`. When either document is published on `main` in its wording-amended form, the text at that commit still governs (D8).
+**Upstream documents.** The spec adopts the Frame's lists "as written at" Frame lock commit `dd9ca140cab2818189d767e751d07fe47a788caf` (tag `brief/lead-session-gh-token/frame-locked`). That commit is provenance only, and no task reads it. Read the Frame and the intake on `main`, at `docs/intent/lead-session-gh-token-frame.md` and `docs/intent/lead-session-gh-token.md`, on `main` since PR #16 as a wording-amended version of the locked Frame. The adopted lists are unchanged in that copy, so reading `main` is reading what the spec adopts (D8).
 
 **Go/no-go on the trunk: go.** Checked against `main` at `7fd2fa5cb70252ddf795f9b80b341574c9158176` by reading files and git objects. No build or test was run in authoring.
 
@@ -82,7 +82,7 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
 - **Type:** test
 - **Depends on:** None
 - **Delivery:** `test-plan`
-- **What:** Glitch writes the feature's test plan from the spec and the Frame at `dd9ca140cab2818189d767e751d07fe47a788caf`, without reading the code. It names the edge areas that T3, T6 and T8 drive. It lands as its own documentation pull request before any build task is dispatched.
+- **What:** Glitch writes the feature's test plan from the spec and the Frame on `main` at `docs/intent/lead-session-gh-token-frame.md` (D8), without reading the code. It names the edge areas that T3, T6 and T8 drive. It lands as its own documentation pull request before any build task is dispatched.
 - **Reaches:** nothing runnable. It is the input to T3, T6 and T8.
 - **Acceptance Criteria:**
   - [ ] The test plan is on `main` at `docs/plans/2026-11-25-lead-session-gh-token-test-plan.md` before T2 or T4 is dispatched (D9).
@@ -132,6 +132,7 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
 - **Reaches:** the same surface as T2, through the built binary.
 - **Acceptance Criteria:**
   - [ ] R-1 (built binary): with an empty `HOME`, `token --landing myorg/myrepo` exits non-zero, and its stderr contains `open config` and not `usage`. This is the positive control. `--landing=o/r`, `--landing a/b/c` and the single argument `-x` each exit non-zero with empty stdout, and with stderr containing `usage` and not `open config`.
+  - [ ] R-1, TP-L10 (built binary): with an empty `HOME`, `token someowner` gives stderr containing `open config` and not `usage`. A single argument not beginning with `-` still reaches the owner form.
   - [ ] R-2 (built binary, no service-account token):
     - `--landing unknown-owner/r` gives stderr containing `unknown owner`.
     - An insecure API base gives `https scheme required`.
@@ -141,7 +142,7 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
     - On a widened grant, stdout is empty and the exit is non-zero.
     - The test skips without both variables, so the macOS skip count, counted by `CLAUDE.md`'s `grep -c '^--- SKIP'` method, reads 3.
 - **Test Expectations:** Black-box only. They must fail when the binary is missing. Fixture tokens follow D3.
-- **Anchors:** D2, D5
+- **Anchors:** D2, D5, D15
 
 ### T4 — The `gh` shim: resolve, mint, hand off, record
 
@@ -201,7 +202,7 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
     3. the real-`gh` path, refusals, mint and hand-off, R-10 to R-13, R-15, R-16 and R-39;
     4. the record, R-21 and R-22;
     5. R-14's static check, its seeded copies and the three *macOS runtime* tests.
-- **Anchors:** D1, D3, D6, D8, D10, D13
+- **Anchors:** D1, D3, D6, D8, D10, D13, D17, D18
 
 ### T5 — Volume warning and marker
 
@@ -224,7 +225,7 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
   - R-22's skip: with the record unwritable, no marker is created and no warning prints.
   - The R-23 Reader is D14 and is not a criterion here.
   - Mutation target: the threshold arithmetic and the marker creation, as convention only (D10). Expect 1 agent run.
-- **Anchors:** D3, D10, D13, D14
+- **Anchors:** D3, D10, D13, D14, D17
 
 ### T6 — `gh` shim edge tests
 
@@ -239,8 +240,15 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
   - [ ] R-13, R-15: on the success path, the fake `gh` receives `GH_TOKEN` equal to the helper's line, the two dedicated directories, and the argv unchanged. The shim's exit status equals the fake `gh`'s.
   - [ ] R-21: for each outcome, the record line has `## Data Model`'s five tab-separated fields, in order, with the closed values for class and outcome.
   - [ ] R-23, R-24: past the line, one warning line in R-24's form and one marker in `## Data Model`'s form; none on a second call that day.
+  - [ ] R-14, TP-S12: after a successful call, the token is in neither fake's argv, not in the shim's own stdout or stderr (the fake `gh`'s output excluded), and in no file under the test's temporary root, with `TMPDIR` inside that root. The same file scan finds a token the test plants under `TMPDIR`, which is the control.
+  - [ ] R-16, TP-S13: two consecutive calls run the fake helper twice, the two tokens differ, and neither token is found under the test's temporary root afterwards, by TP-S12's scan and its control.
+  - [ ] R-19, TP-S14: with the session in clone A, a call with `GH_REPO=other/x`, a call from another clone's directory, and a call with `-R other/x` each give the fake helper A's `owner/repo`, and the fake `gh` the call's argv unchanged.
+  - [ ] R-21, TP-S19: a pre-existing state directory at `0755` and record file at `0644` read back as `0700` and `0600` after a call.
+  - [ ] R-22, TP-S20: with the state directory's path occupied by a regular file, the fake `gh` still runs, stderr holds exactly one line beginning `gh shim: record:`, and that line holds no token.
+  - [ ] R-23, TP-S23: with today's record seeded with 180 `minted` lines, a minting call (N = 181) prints no `gh shim: volume warning:` line, and no marker file exists afterwards. This is the control for the warning case.
+  - [ ] R-23, TP-S24: with the marker's path occupied by a directory and today's record seeded past the line, a minting call writes a stderr line beginning `gh shim: volume:`, and the fake `gh` still runs.
 - **Test Expectations:** Black-box. They must fail when the tracked shim is missing. The edge author writes its own recording fake `gh` from the spec, and may reuse T4's process plumbing (temporary root, fake harness process). Fixture tokens follow D3.
-- **Anchors:** D2
+- **Anchors:** D2, D15, D17, D18
 
 ### T7 — S7's one command
 
@@ -258,8 +266,9 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
     - Each of these exits 1, naming `pin-canary`: a fake `gh` printing another repository; a failing fake helper with an expected-repository `minted` line seeded into the record; a record path occupied by a directory.
     - A fake `gh` printing `User` exits 1, naming `login-check`.
     - The command's stdout and stderr hold no token, and the shared seeded control, applied to a copy of the command, makes that scan fail.
+  - [ ] R-28: when T7 lands, the command's usage text, which states the pinned invocation form, is recorded on task #4741 in the maintainer's tracker (D16).
 - **Test Expectations:** Each exit class, and each check's failure at its own position, with the earlier checks passing. Mutation target: the command's decision logic, as convention only (D10). Expect 1 to 2 agent runs.
-- **Anchors:** D1, D3, D10, D14
+- **Anchors:** D1, D3, D10, D14, D16, D19
 
 ### T8 — S7 command edge tests
 
@@ -271,8 +280,9 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
 - **Reaches:** the same surface as T7.
 - **Acceptance Criteria:**
   - [ ] R-28: one case each gives exit 0; exit 1 with `byte-compare`; exit 1 with `pin-canary`; exit 1 with `login-check`; and exit 2 with `preconditions`. No case's output holds a token.
+  - [ ] R-28: every test calls the command in the invocation form T7 pinned, and each test file's header states that form, taken from the usage text recorded on task #4741 in the maintainer's tracker at T7's landing (D16).
 - **Test Expectations:** Black-box. They must fail when the command is missing.
-- **Anchors:** D2
+- **Anchors:** D2, D15, D16, D19
 
 ### T9 — README setup and reversal
 
@@ -436,13 +446,18 @@ T1, T9 and T10 to T15 change no code: T1, T9 and T10 are documents, and T11 to T
 | D5 | The landing mint's in-gate edge tests reach argument handling and order (R-1, R-2). The mint path through the built binary is reached only by the skip-gated R-5 test and live at `LT-1`. This is not a layer: `--landing` is reachable through the built binary from T2. | R-5 rules out a new key-source seam, and `CLAUDE.md` records the seam as deliberately not added. | spec R-5; spec `## Constraints`, "A green `just check` does not cover the built binary's mint path"; `CLAUDE.md`, "What is still open" |
 | D6 | No code toggle. The shim reaches no session until T12's hand deploy and wiring line, a level-3 stop. The run with nobody present waits on R-31's lead-held gate. | No task before T12 exposes the shim to a user, so a toggle would guard nothing. | dev-loop `<slicing>`, "No toggle unless a task before the feature's last would expose unfinished behaviour"; spec `## First real run`, "a lead-held gate, not a code toggle" |
 | D7 | Every planned code delivery lands before T12 deploys the wiring. A landing after T12, such as a fix, follows the spec's answered row (b): it lands through the shim after a recorded read, at the maintainer's terminal, of the personal installation's repository selection, with R-27's reversal as the escape when the shim itself is broken. | This keeps planned work off the shim, and gives later work the route the maintainer chose. | spec `## Decision levels`, "How sigil's own changes land once the wiring is deployed"; V-Reversibility |
-| D8 | Implementers read the Frame and the intake at `dd9ca140cab2818189d767e751d07fe47a788caf`, by `git show <commit>:<path>`. A diff of the wording-amended Frame against that commit, at authoring, showed eight changed lines. None is in an `FD-n` Observable list or the `LT` table. The changes in `FD-9` and `DEF-1` reword how the daily limit is named and leave the rule and its figures unchanged. | The spec adopts those lists "as written at the commit above". At authoring, that commit is reachable only through local refs and is not on `main`. | spec `## Purpose`, "adopts that list as written at the commit above"; P-PreserveDecisionSpace, "A provenance fact is copied verbatim from its source" |
+| D8 | Implementers read the Frame and the intake on `main`, at `docs/intent/lead-session-gh-token-frame.md` and `docs/intent/lead-session-gh-token.md`, on `main` since PR #16 as a wording-amended version of the locked Frame. No task tells an agent to read the lock commit `dd9ca140cab2818189d767e751d07fe47a788caf`; the plan keeps that SHA as provenance only. Evidence: the amended Frame differs from the lock commit in wording only, at lines 93, 372, 390, 392, 473, 500, 556, 573 and 575, and the intake does not differ. None of those lines is an `FD-n` Observable line, an `LT` row, a signed line, the actor set or a known gap, and `FL-5`'s wording was approved by the maintainer. A reader who finds an adopted list differing on `main` stops and raises it to the lead. | The lock commit holds private deployment text, and implementers edit public files such as `CLAUDE.md` with what they read in context. The spec adopts the Frame's lists "as written at the commit above", and those lists are unchanged on `main`. | spec `## Constraints`, "Public repository"; spec `## Purpose`, "adopts that list as written at the commit above"; P-PreserveDecisionSpace, "A provenance fact is copied verbatim from its source" |
 | D9 | One test plan for the feature, at `docs/plans/2026-11-25-lead-session-gh-token-test-plan.md`, landed as its own documentation delivery before any build task. | This repository has no test-plan convention. The path sits beside this plan, and landing it first lets T3, T6 and T8 read it from `main`. | dev-loop `<tests>`, "A test plan derived from the spec before the build" |
 | D10 | Mutation testing is not priced and not wired here. Each task's mutation target is convention, never reported as an enforced gate. The spec's seeded copies are the hand-mutation sample for the shim, the static check and the command. | Adding a mutation tool is a new dependency, and the spec approves none. | spec `## Decision levels`, "Any new dependency … None approved"; dev-loop `<mutation>`, "never report a mutation gate as in force" |
 | D11 | `NO-TASK`: no walking skeleton and no `verify-smoke` recipe. | sigil already runs. Wiring `verify-smoke` and `puck floor check` into the gate would change the `check` recipe, which the spec's out-of-scope list forbids. If floor adoption is wanted, it is separate work. | spec `## Out of scope`, "changes … to the justfile's `ci`, `check`, `test`, `vet` or `fmt-check` recipes" |
 | D12 | `NO-TASK`: the spec's level-4 rows (reads-per-mint after `LT-7` or R-32, and the daily limit) and the counting-window row after a reset mismatch get no task. | Each fires on a live result that may never occur. When it does, it is a tracked change under its row, followed by R-28's command, as the rows state. | spec `## Decision levels`, rows "Updating reads-per-mint after `LT-7` or R-32" and "The counting window after R-32 finds a reset mismatch" |
 | D13 | R-23 and R-24 are a second build task (T5) in the `gh-shim` delivery, not a separate delivery. T4 implements R-9's steps 1 to 6 and 8, and T5 fills step 7 before that delivery lands. | R-9 is a list of SHALL steps. A separate delivery would leave step 7 missing on `main` for one landing. In one delivery, R-9 holds in full at its landing. | Wyrd stance, "Every requirement maps to exactly one task"; dev-loop `<slicing>`, "Each commit of a multi-commit landing counts" |
 | D14 | The monthly lead-session run is parked, human-noticed, monthly. It covers R-28's command, R-23's marker read and R-35's abandoned-task read, and also runs after a binary or wiring replacement or a Claude Code upgrade. It is a standing procedure, not build work. | The spec parks it with that cadence and builds no detector. | spec `## Constraints`, "Parked, human-noticed"; spec R-23 "Reader" and R-35 "An abandoned open task"; P-Defer DF1 |
+| D15 | Level 5. The edge tests (T3, T6, T8) are Go test files that drive the built binary, the tracked shim and the tracked command through `os/exec`. This settles the test plan's gap G-9. | `just check` runs Go tests, and the spec puts that recipe out of scope, so a test in another language could not run in the gate. | spec `## Decision levels`, level 5, "gate mechanics, reversible choices, anything where building proceeds either way"; spec `## Out of scope`, "the justfile's `ci`, `check`, `test`, `vet` or `fmt-check` recipes"; spec `## Requirements`, "Where each criterion runs" |
+| D16 | Level 5. R-28's invocation form is the builder's choice. T7 pins it and records the command's usage text on task #4741 in the maintainer's tracker when T7 lands, and T8 takes the form from that record. This settles the test plan's gap G-1. | R-28 names the two inputs and not how they are given. The Frame's bounded option-space does not list the invocation form among its Fixed items, so it is free. | Frame `## Locked decisions`, "Bounded option-space for the Spec"; spec `## Decision levels`, level 5, and row "In-repository names for the shim and R-28's command" |
+| D17 | Level 5. The shape of the record's `mint_seconds` field is pinned by T4's own unit tests, since T4 writes R-21's record line. The marker's time format is pinned by T5's own unit tests. The edge tests assert only what the spec states: the marker holds two tab-separated fields, a non-empty creation time and N; `mint_seconds` is a non-empty decimal number where a mint was attempted, and empty otherwise. This settles the test plan's gaps G-2 and G-3. | The spec's `## Data Model` gives no time format for the marker and no bound on `mint_seconds`. Either shape is reversible and building proceeds either way. | spec `## Decision levels`, level 5; spec `## Data Model`, "warning marker" and field `mint_seconds` |
+| D18 | Level 5. R-9's "one stderr line beginning `gh shim: <class>:`" is read as exactly one stderr line beginning `gh shim: <class>:`. Other stderr lines may appear: helper stderr that R-12 passes through, and R-22's `gh shim: record:` line when the record cannot be written. This settles the test plan's gap G-4. | R-12 passes the helper's stderr through, so a `mint-failed` call can write more than one stderr line in total. A failing call that is recorded can also meet R-22's record failure, so a reading of exactly one line beginning `gh shim: ` would reject a correct shim. | spec `## Decision levels`, level 5; spec R-9, "Each failure writes one stderr line"; spec R-12, "pass its stderr through"; spec R-22 |
+| D19 | Level 5. R-28's Preconditions are read as its Acceptance text states them: a given clone resolving to the expected repository, or a working directory outside the given clone, exits 2 naming `preconditions`, before any shim call. This settles the test plan's gap G-10. | The two Preconditions bullets read as failure causes, while the Acceptance bullet and the pin canary's meaning make them conditions that must hold. The Acceptance text is the binary-observable one. | spec `## Decision levels`, level 5; spec R-28, "Acceptance" |
 
 ## Sequencing
 
