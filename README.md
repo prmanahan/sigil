@@ -197,6 +197,66 @@ You need a 1Password plan with service accounts and Go 1.26.11 or newer.
 
 12. **Verify.** `sigil-helper doctor` checks the config, that the service-account token is set, the key read and a JWT mint without contacting GitHub. After that, a successful push doesn't prove Sigil served it, because another helper may hold a valid token too. To check, empty `~/.cache/sigil`, push or fetch a private repository, and look for a new file there. A fetch from a public repository won't do, because git only asks for a credential when GitHub challenges it.
 
+### Optional: the `gh` shim for agent sessions
+
+`gh` on its own uses whatever login it holds. The shim is a replacement `gh` for agent sessions: it finds the repository the session is working in, mints a landing token for that repository only (`sigil-helper token --landing <owner>/<repo>`), and runs the real `gh` with that token in that one process's environment. It is `shim/gh` in this repository, a POSIX `sh` script, and nothing installs it for you. This is task #4741 in the maintainer's tracker.
+
+**What it can take down.** Once the wiring line below is in place, every Claude Code session on the machine, lead or dispatched, runs `gh` through the shim. Outside a clone whose `origin` is an `https://github.com/<owner>/<repo>` URL, `gh` fails with a `gh shim:` line instead of running. The same goes for any call where the mint fails. Nothing falls back to your own `gh` login. The shim also runs `gh` with its own config directory (`~/.config/sigil/gh`) and data directory (`~/.local/share/sigil/gh-data`), so `gh`'s stored login is not used. Your terminal is unaffected, because the wiring only fires when `CLAUDECODE` is set.
+
+1. **Choose the shim directory.** It holds `gh` and nothing else, and it must sit outside every directory already on `PATH`, or the shim would shadow `gh` for your terminal too. I use `~/.local/share/sigil/gh-shim-bin`. Run `mkdir -p ~/.local/share/sigil/gh-shim-bin` and `chmod 700` it.
+
+2. **Write the real-`gh` path.** The shim needs the absolute path of the real `gh`, and it finds it in the first line of `~/.config/sigil/gh-real-path`. Setting `SIGIL_GH_REAL` in the environment overrides the file. Take the path from a shell that is not wired, before step 5, and check what you wrote:
+
+   ```bash
+   command -v gh > ~/.config/sigil/gh-real-path
+   cat ~/.config/sigil/gh-real-path    # one absolute path to the gh binary, not an alias or a function
+   ```
+
+   **It must be a real binary, not a wrapper that calls `gh` from `PATH`.** The shim refuses a path that is its own file, by path or by file identity. It can't see through a wrapper: a script that runs `gh` from `PATH` finds the shim again, and each pass mints another token and spends the 1Password rate limit. That limit is documented, not checked.
+
+3. **Place the shim by a temporary name, then rename it onto `gh`.** The rename means a session never finds a half-written `gh`:
+
+   ```bash
+   install -m 755 shim/gh ~/.local/share/sigil/gh-shim-bin/.gh.new
+   mv ~/.local/share/sigil/gh-shim-bin/.gh.new ~/.local/share/sigil/gh-shim-bin/gh
+   ```
+
+4. **Add the wiring line**, as the last `PATH` change in `~/.zshrc` and in no other start-up file. It prepends the shim directory only when `CLAUDECODE` is non-empty:
+
+   ```sh
+   if [ -n "${CLAUDECODE-}" ]; then PATH="$HOME/.local/share/sigil/gh-shim-bin:$PATH"; fi
+   ```
+
+5. **Verify**, from a new session. A session that started earlier keeps its old `PATH`.
+   - In a Claude Code session, `command -v gh` prints the shim path. In your own terminal it prints the real `gh`.
+   - `cmp shim/gh ~/.local/share/sigil/gh-shim-bin/gh` exits 0, so what is deployed is the tracked script.
+   - `gh api repos/<owner>/<repo>` from inside a covered clone returns, and adds a line to today's record.
+
+**Deploy order.** Each step is a stop if it fails, and the next one waits.
+
+1. **The `sigil` binary.** Keep the prior one first, outside every `PATH` directory so a second `sigil` never sits where a shell could find it: copy `~/.local/bin/sigil` to `~/.local/share/sigil/sigil.prev`, then record `shasum -a 256` of both files and check the two values are equal. Run `sigil-helper doctor` once and note it passes. Build the new binary to a temporary name, rename it onto `sigil`, and record its `shasum -a 256` and the `git rev-parse HEAD` of the commit it was built from. This replaces the binary every wired clone's `git` uses, so the credential-helper path is the one to watch.
+2. **A landing mint, typed by hand at your terminal:** `sigil-helper token --landing <owner>/<repo>` against a throwaway repository. The token prints on your screen, so don't run it from an agent's tool call, where it would land in a transcript. A zero exit means GitHub's grant matched the request.
+3. **The shim**, steps 1 to 3 above.
+4. **The wiring line**, step 4 above, then step 5.
+
+**Reversal order.** Do these in order; the first is what stops new sessions using the shim.
+
+1. Remove the wiring line from `~/.zshrc`.
+2. Restart running sessions. They keep the shim on `PATH` until they end.
+3. Remove the shim: `rm ~/.local/share/sigil/gh-shim-bin/gh`, then the directory.
+4. Restore the prior binary: check `shasum -a 256 ~/.local/share/sigil/sigil.prev` matches the value you recorded, copy it to a temporary name in `~/.local/bin` and rename that onto `~/.local/bin/sigil`, then check `shasum -a 256 ~/.local/bin/sigil` matches the recorded value again.
+5. In a new session, `command -v gh` prints the real `gh`.
+
+`~/.config/sigil/gh-real-path` and the record directory are inert once the shim is gone, and you can delete them. The shim never needed a harness permission rule containing `sigil`, so reversal has none to remove.
+
+**Reading the record.** Every call that gets as far as finding the repository adds one tab-separated line to `~/.local/state/sigil/gh-shim/<UTC date>.log`: time, `<owner>/<repo>`, the grant class, the outcome and the mint time in seconds. It holds no token. When a day's mint count nears 70% of an assumed daily read limit, the shim prints a volume warning once and leaves a `<UTC date>.warned` marker in the same directory. One command reads both:
+
+```bash
+tail -n +1 ~/.local/state/sigil/gh-shim/*.log ~/.local/state/sigil/gh-shim/*.warned
+```
+
+(`zsh` says `no matches found` for a pattern with no files, which means nothing has been recorded yet.)
+
 ### Optional: a second remote for your own pushes
 
 GitHub records a push against the credential that made it, so pushes through Sigil are recorded as the App. To keep some pushes under your own name, add a second remote over SSH with `git remote add ssh_origin git@github.com:<owner>/<repo>.git` and push to it by name, since SSH uses your own key and never consults git's credential system. Don't combine this with a `url.<base>.insteadOf` rewrite of `git@github.com:` to HTTPS, because `insteadOf` applies to remote names too and would send those pushes through Sigil as the App.
@@ -210,6 +270,7 @@ Anything that reads the key needs `OP_SERVICE_ACCOUNT_TOKEN` in the environment,
 | `sigil-helper` or `sigil-helper get` | The credential-helper path. Reads a request on stdin and writes credentials to stdout |
 | `sigil-helper token <owner>` | Prints a full-permission installation token for that owner, cached. Refuses a pipe or a file as stdout, though `> /dev/null` passes and still mints and caches |
 | `sigil-helper token --rate-limit-only <owner>/<repo>` | Prints a token with `metadata:read` on exactly one public repository, which is enough to raise the REST rate limit and nothing else. GitHub's grant is verified first, and a mismatch revokes the token and errors. A private repository counts as a mismatch. Never cached, and it runs unattended |
+| `sigil-helper token --landing <owner>/<repo>` | Prints a write-capable token for exactly one repository: `contents`, `pull_requests` and `workflows` write, `checks` and `metadata` read. GitHub's grant is verified first, and a mismatch revokes the token and errors. Never cached, and it runs unattended. The `gh` shim calls it |
 | `sigil-helper doctor` | Checks the config, that the service-account token is set, the key read and a JWT mint without contacting GitHub. Prints the App ID, counts and sizes, and never key or token material |
 | `sigil-helper store` or `erase` | No-ops, because git expects them to exist |
 
