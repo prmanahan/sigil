@@ -15,6 +15,12 @@ package main
 //                                              metadata:read on exactly one repo; verified
 //                                              against GitHub's actual grant before being
 //                                              trusted or printed; never cached
+//   sigil token --landing <owner>/<repo>
+//                                            — mint and print a landing token: a fixed
+//                                              five-permission set on exactly one repo;
+//                                              verified against GitHub's actual grant
+//                                              before being trusted or printed; never
+//                                              cached; no terminal check (unattended)
 //   sigil doctor                            — verify config + key + one mint; print safe summary
 //
 // Security invariants:
@@ -31,6 +37,12 @@ package main
 //     one-shot credential, not a long-lived one. ⇒ Breaking the verification lets a
 //     silently-widened grant (e.g. an empty permissions object granting everything,
 //     write included — measured against a live installation) reach stdout unnoticed.
+//   - Landing token (--landing): the access_tokens request body is fixed in code — the
+//     five-permission landing set on exactly one repo, never built from unvalidated input. GitHub's
+//     actual grant is verified by exact match (private repositories allowed) before the
+//     token is trusted or printed; any mismatch revokes it and returns an error. Never
+//     cached. Unattended by design: it runs no terminal check, so it is write-capable
+//     with nobody present. ⇒ Breaking the verification lets a widened grant reach stdout.
 //   - Full-permission token (sigil token <owner>): refused when stdout is not a
 //     terminal, before the key read and before any network call. This is a
 //     speed bump and not a boundary — a pty defeats it, and `sigil get` plus the
@@ -187,12 +199,17 @@ func cmdToken(owner string) error {
 // is not used.
 const rateLimitOnlyFlag = "--rate-limit-only"
 
-// dispatchToken enumerates the exactly two permitted shapes of `sigil token` and
+// landingFlag selects the landing form of `sigil token`. Checked by exact
+// string equality only, like rateLimitOnlyFlag.
+const landingFlag = "--landing"
+
+// dispatchToken enumerates the exactly three permitted shapes of `sigil token` and
 // rejects everything else — before any config load, key read, or network call.
 // args is everything after the "token" subcommand word itself.
 //
-//	token <owner-or-path>                    (1 arg)  — unchanged, delegates to cmdToken
+//	token <owner-or-path>                    (1 arg)  — delegates to cmdToken; must not begin with "-"
 //	token --rate-limit-only <owner>/<repo>   (2 args)  — delegates to cmdTokenNarrowed
+//	token --landing <owner>/<repo>           (2 args)  — delegates to cmdTokenLanding
 //
 // ⛔ This enumerates the permitted forms rather than scanning args for the flag
 // and taking the last element: that shape would let a typo'd or misplaced flag
@@ -202,7 +219,7 @@ const rateLimitOnlyFlag = "--rate-limit-only"
 // permissions object in the request was granted every installation
 // permission, write included), moved into this parser instead.
 func dispatchToken(args []string) error {
-	const usage = "usage: sigil token <owner> | sigil token --rate-limit-only <owner>/<repo>"
+	const usage = "usage: sigil token <owner> | sigil token --rate-limit-only <owner>/<repo> | sigil token --landing <owner>/<repo>"
 
 	switch len(args) {
 	case 1:
@@ -215,8 +232,21 @@ func dispatchToken(args []string) error {
 		if strings.HasPrefix(args[0], rateLimitOnlyFlag+"=") {
 			return fmt.Errorf("%s (--rate-limit-only takes a separate <owner>/<repo> argument, not %s=value)", usage, rateLimitOnlyFlag)
 		}
+		// Any other single argument beginning with "-" is a flag, never an
+		// owner: a typo'd or unknown flag must not fall through to the
+		// full-permission mint as a literal owner name.
+		if strings.HasPrefix(args[0], "-") {
+			return fmt.Errorf("%s (a single argument beginning with %q is not an owner)", usage, "-")
+		}
 		return cmdToken(args[0])
 	case 2:
+		if args[0] == landingFlag {
+			owner, repo, err := parseOwnerRepo(args[1])
+			if err != nil {
+				return fmt.Errorf("%s: %w", usage, err)
+			}
+			return cmdTokenLanding(owner, repo)
+		}
 		if args[0] != rateLimitOnlyFlag {
 			return errors.New(usage)
 		}
@@ -284,6 +314,49 @@ func cmdTokenNarrowed(owner, repo string) error {
 	}
 
 	// Token to stdout is sanctioned for this subcommand.
+	fmt.Println(token)
+	return nil
+}
+
+// cmdTokenLanding mints and prints a landing installation token for owner/repo
+// to stdout: the contract's fixed five-permission set on exactly that
+// repository, verified against GitHub's actual grant before being printed (see
+// getLandingToken). Never cached, and no terminal check: unattended use is the
+// point of this form.
+//
+// Order: config load, scheme check, owner routing, key read, exchange. Routing
+// runs before the key read, so an unknown owner never touches 1Password.
+func cmdTokenLanding(owner, repo string) error {
+	cfg, err := loadConfigDefault()
+	if err != nil {
+		return err
+	}
+
+	if err := validateAPIBase(apiBase()); err != nil {
+		return err
+	}
+
+	// Routing before the key read, as cmdTokenNarrowed does; getLandingToken
+	// routes again itself, and routing is a pure map lookup.
+	if _, err := resolveInstallation(cfg, owner); err != nil {
+		return err
+	}
+
+	// One bounded context covers the key read and the API exchange.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	key, err := readKey(ctx, cfg.OPKeyRef)
+	if err != nil {
+		return err
+	}
+
+	token, err := getLandingToken(ctx, cfg, key, owner, repo, apiBase())
+	if err != nil {
+		return err
+	}
+
+	// Token to stdout is sanctioned for this subcommand, as one line.
 	fmt.Println(token)
 	return nil
 }

@@ -834,3 +834,291 @@ func TestCLI_LeakScan_TokenNotInStderr(t *testing.T) {
 		}
 	}
 }
+
+// --- `sigil token --landing <owner>/<repo>` (task #4741 in the maintainer's tracker, T3) ---
+//
+// Edge tests for the landing mint, driving only the built binary (argv, env,
+// stdin, exit code, stdout, stderr, files under HOME). Derived from the spec
+// (docs/specs/lead-session-gh-token.md R-1, R-2, R-4, R-5) and the test plan
+// (docs/plans/2026-11-25-lead-session-gh-token-test-plan.md, TP-L0 to TP-L10).
+// Declared reads: the existing harness in this file and cli_cache_test.go (the
+// build in TestMain, the helpers above, the SIGIL_GITHUB_API_URL seam and its
+// loopback-http rule). token_landing.go and main.go's landing code were not read.
+//
+// Answer to the test plan's G-8: the binary accepts a loopback http:// API base
+// (the existing skip-gated tests rely on it), so a plain httptest server serves
+// TP-L8 and TP-L9; no TLS server is needed.
+//
+// Fixture tokens are built at runtime and are not ghs_-shaped (spec Constraints).
+
+// landingFixtureToken returns a per-run fake token that no secret-scan rule matches.
+func landingFixtureToken(label string) string {
+	return fmt.Sprintf("landing-fixture-%s-%d", label, time.Now().UnixNano())
+}
+
+// landingEnv is an exact environment with no service-account token, a given HOME
+// and any extra entries. Only the variables the binary needs are passed.
+func landingEnv(home string, extra ...string) []string {
+	env := []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+	return append(env, extra...)
+}
+
+// TP-L0 (R-1): the artifact exists and is executable; fails, never skips, when not.
+func TestCLI_Landing_BinaryExistsAndIsExecutable(t *testing.T) {
+	// Given the built sigil path
+	info, err := os.Stat(binaryPath)
+	// Then it exists and is executable
+	if err != nil {
+		t.Fatalf("built sigil binary missing at %q: %v", binaryPath, err)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Fatalf("built sigil binary at %q is not executable (mode %v)", binaryPath, info.Mode())
+	}
+}
+
+// TP-L1 (R-1): the well-formed landing form is accepted by argument parsing and
+// reaches config load. Positive control for TP-L2 to TP-L4.
+func TestCLI_Landing_WellFormedArgs_ReachConfigLoad(t *testing.T) {
+	// Given an empty HOME
+	home := t.TempDir()
+	// When `token --landing myorg/myrepo` runs
+	r := runSigilWithEnv(t, []string{"token", "--landing", "myorg/myrepo"}, "", landingEnv(home))
+	// Then it exits non-zero at config load, not at argument parsing
+	if r.exitCode == 0 {
+		t.Errorf("exit code: got 0, want non-zero")
+	}
+	if r.stdout != "" {
+		t.Errorf("stdout: got %q, want empty", r.stdout)
+	}
+	if !strings.Contains(r.stderr, "open config") {
+		t.Errorf("stderr: got %q, want it to contain \"open config\"", r.stderr)
+	}
+	if strings.Contains(r.stderr, "usage") {
+		t.Errorf("stderr: got %q, want no \"usage\" for a well-formed shape", r.stderr)
+	}
+}
+
+// TP-L2 to TP-L4 (R-1): each rejected shape is refused by argument parsing,
+// before config load. One row per spec-named shape, not per cause.
+func TestCLI_Landing_RejectedShapes_UsageBeforeConfigLoad(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"TP-L2 equals form", []string{"token", "--landing=o/r"}},
+		{"TP-L3 two slashes", []string{"token", "--landing", "a/b/c"}},
+		{"TP-L4 single dash argument", []string{"token", "-x"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given an empty HOME
+			home := t.TempDir()
+			// When the rejected shape runs
+			r := runSigilWithEnv(t, tc.args, "", landingEnv(home))
+			// Then non-zero, empty stdout, usage and no config load
+			if r.exitCode == 0 {
+				t.Errorf("exit code: got 0, want non-zero for %v", tc.args)
+			}
+			if r.stdout != "" {
+				t.Errorf("stdout: got %q, want empty for %v", r.stdout, tc.args)
+			}
+			if !strings.Contains(r.stderr, "usage") {
+				t.Errorf("stderr: got %q, want \"usage\" for %v", r.stderr, tc.args)
+			}
+			if strings.Contains(r.stderr, "open config") {
+				t.Errorf("stderr shows config load for a rejected shape %v: %s", tc.args, r.stderr)
+			}
+		})
+	}
+}
+
+// TP-L10 (R-1): a single argument not beginning with `-` still reaches the owner form.
+func TestCLI_Token_SingleNonDashArgument_StillReachesOwnerForm(t *testing.T) {
+	// Given an empty HOME
+	home := t.TempDir()
+	// When `token someowner` runs
+	r := runSigilWithEnv(t, []string{"token", "someowner"}, "", landingEnv(home))
+	// Then it reaches config load and is not refused as a usage error
+	if !strings.Contains(r.stderr, "open config") {
+		t.Errorf("stderr: got %q, want \"open config\"", r.stderr)
+	}
+	if strings.Contains(r.stderr, "usage") {
+		t.Errorf("stderr: got %q, want no \"usage\"", r.stderr)
+	}
+}
+
+// TP-L5 (R-2): routing is fail-closed on an unknown owner, with no service-account token.
+func TestCLI_Landing_UnknownOwner_FailsAtRouting(t *testing.T) {
+	// Given a config that routes one known owner and no service-account token
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "known-owner"))
+	// When `token --landing unknown-owner/r` runs
+	r := runSigilWithEnv(t, []string{"token", "--landing", "unknown-owner/r"}, "", landingEnv(home))
+	// Then non-zero, "unknown owner", empty stdout
+	if r.exitCode == 0 {
+		t.Errorf("exit code: got 0, want non-zero")
+	}
+	if r.stdout != "" {
+		t.Errorf("stdout: got %q, want empty", r.stdout)
+	}
+	if !strings.Contains(r.stderr, "unknown owner") {
+		t.Errorf("stderr: got %q, want \"unknown owner\"", r.stderr)
+	}
+}
+
+// TP-L6 (R-2): the scheme check runs before routing. Both faults at once.
+func TestCLI_Landing_InsecureAPIBase_RefusedBeforeRouting(t *testing.T) {
+	// Given a config, a cleartext remote API base, and an owner that is also unknown
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "known-owner"))
+	env := landingEnv(home, "SIGIL_GITHUB_API_URL=http://evil.example.com")
+	// When `token --landing unknown-owner/r` runs
+	r := runSigilWithEnv(t, []string{"token", "--landing", "unknown-owner/r"}, "", env)
+	// Then the scheme error shows, not the routing error
+	if r.exitCode == 0 {
+		t.Errorf("exit code: got 0, want non-zero")
+	}
+	if r.stdout != "" {
+		t.Errorf("stdout: got %q, want empty", r.stdout)
+	}
+	if !strings.Contains(r.stderr, "https scheme required") {
+		t.Errorf("stderr: got %q, want \"https scheme required\"", r.stderr)
+	}
+	if strings.Contains(r.stderr, "unknown owner") {
+		t.Errorf("stderr: got %q, want scheme check before routing", r.stderr)
+	}
+}
+
+// TP-L7 (R-2): no terminal check; a known owner reaches the key read under a pipe.
+func TestCLI_Landing_KnownOwnerUnderPipe_ReachesKeyRead(t *testing.T) {
+	// Given a known owner, no service-account token, stdout a pipe (exec's capture)
+	home := writeTempConfig(t, minimalConfig("op://v/i/k.pem", 1, 9999, "known-owner"))
+	// When `token --landing known-owner/r` runs
+	r := runSigilWithEnv(t, []string{"token", "--landing", "known-owner/r"}, "", landingEnv(home))
+	// Then the run reached the key read and was not refused for a non-terminal stdout
+	if r.exitCode == 0 {
+		t.Errorf("exit code: got 0, want non-zero")
+	}
+	if r.stdout != "" {
+		t.Errorf("stdout: got %q, want empty", r.stdout)
+	}
+	if !strings.Contains(r.stderr, "OP_SERVICE_ACCOUNT_TOKEN is not set") {
+		t.Errorf("stderr: got %q, want \"OP_SERVICE_ACCOUNT_TOKEN is not set\"", r.stderr)
+	}
+	if strings.Contains(r.stderr, stdoutNotATerminalMarker) {
+		t.Errorf("stderr: got %q, landing mint must not check for a terminal", r.stderr)
+	}
+}
+
+// landingMock is a recording GitHub mock for the skip-gated tests. The grant it
+// returns is chosen per test; revokes are reported on a channel.
+type landingMock struct {
+	srv     *httptest.Server
+	revokes chan string // Authorization header of each DELETE /installation/token
+}
+
+func newLandingMock(t *testing.T, token string, grant map[string]string) *landingMock {
+	t.Helper()
+	m := &landingMock{revokes: make(chan string, 16)}
+	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/installation/token" {
+			m.revokes <- r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{
+			"token":                token,
+			"permissions":          grant,
+			"repository_selection": "selected",
+			"repositories":         []map[string]any{{"name": "repo", "private": true}},
+		})
+	}))
+	t.Cleanup(m.srv.Close)
+	return m
+}
+
+// landingContractGrant is the spec's `## API Contract` permission map.
+func landingContractGrant() map[string]string {
+	return map[string]string{
+		"contents": "write", "pull_requests": "write", "checks": "read",
+		"workflows": "write", "metadata": "read",
+	}
+}
+
+// cacheFiles lists every file under HOME's sigil cache directory.
+func cacheFiles(home string) []string {
+	var files []string
+	_ = filepath.WalkDir(filepath.Join(home, ".cache", "sigil"), func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	})
+	return files
+}
+
+// TP-L8 and TP-L9 (R-4, R-5): skip-gated sibling of TestCLI_LeakScan_TokenNotInStderr,
+// gated on the same two variables. One top-level test with two subtests, so the
+// macOS skip count (top-level `--- SKIP` lines) rises from 2 to 3, not 4.
+func TestCLI_Landing_LeakScan_TokenOnStdoutOnly(t *testing.T) {
+	skipIfNoOPToken(t)
+	opKeyRef := os.Getenv("SIGIL_TEST_OP_KEY_REF")
+	if opKeyRef == "" {
+		t.Skip("SIGIL_TEST_OP_KEY_REF not set")
+	}
+
+	// TP-L8: the unattended landing mint puts the token on stdout alone, caches nothing.
+	t.Run("verified grant", func(t *testing.T) {
+		// Given a mock GitHub returning the contract grant, and stdout a pipe
+		token := landingFixtureToken("ok")
+		mock := newLandingMock(t, token, landingContractGrant())
+		home := writeTempConfig(t, minimalConfig(opKeyRef, 42, 12345, "landing-owner"))
+		env := append(envWithout("SIGIL_GITHUB_API_URL"), "HOME="+home, "SIGIL_GITHUB_API_URL="+mock.srv.URL)
+		// When `token --landing landing-owner/repo` runs
+		r := runSigilWithEnv(t, []string{"token", "--landing", "landing-owner/repo"}, "", env)
+		// Then exit 0, stdout is exactly the token and a newline, stderr is empty
+		if r.exitCode != 0 {
+			t.Fatalf("exit code: got %d, want 0\nstderr: %s", r.exitCode, r.stderr)
+		}
+		if r.stdout != token+"\n" {
+			t.Errorf("stdout: got %q, want exactly the token and one newline", r.stdout)
+		}
+		if r.stderr != "" {
+			t.Errorf("stderr: got %q, want empty", r.stderr)
+		}
+		// And the cache holds no file
+		if files := cacheFiles(home); len(files) != 0 {
+			t.Errorf("landing mint wrote cache files: %v", files)
+		}
+	})
+
+	// TP-L9: a widened grant prints nothing, names no token, is revoked exactly once.
+	t.Run("widened grant", func(t *testing.T) {
+		// Given a mock GitHub whose grant adds one permission to the contract
+		token := landingFixtureToken("wide")
+		grant := landingContractGrant()
+		grant["issues"] = "read"
+		mock := newLandingMock(t, token, grant)
+		home := writeTempConfig(t, minimalConfig(opKeyRef, 42, 12345, "landing-owner"))
+		env := append(envWithout("SIGIL_GITHUB_API_URL"), "HOME="+home, "SIGIL_GITHUB_API_URL="+mock.srv.URL)
+		// When the landing command runs
+		r := runSigilWithEnv(t, []string{"token", "--landing", "landing-owner/repo"}, "", env)
+		// Then non-zero, empty stdout, no token in stderr
+		if r.exitCode == 0 {
+			t.Errorf("exit code: got 0, want non-zero")
+		}
+		if r.stdout != "" {
+			t.Errorf("stdout: got %q, want empty", r.stdout)
+		}
+		if strings.Contains(r.stderr, token) {
+			t.Errorf("token appeared in stderr: %s", r.stderr)
+		}
+		// And the mock received exactly one revoke carrying the minted token
+		if len(mock.revokes) != 1 {
+			t.Fatalf("revoke count: got %d, want 1", len(mock.revokes))
+		}
+		if got := <-mock.revokes; !strings.Contains(got, token) {
+			t.Errorf("revoke Authorization %q does not carry the minted token", got)
+		}
+	})
+}
