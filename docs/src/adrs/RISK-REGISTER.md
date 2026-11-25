@@ -42,7 +42,7 @@ Above-the-bar risks the maintainer accepted or deferred, one entry each, numbere
 - **DFD element:** not stated in the Frame
 - **STRIDE category:** not stated in the Frame
 - **Architecture session:** `docs/intent/lead-session-gh-token-frame.md`, `## Accepted and deferred risks`, `RISK-C`
-- **Rationale:** Per-call minting raises what was a recoverable quota worry to something ordinary use can reach, at least on the lowest tiers. On the reported plan, at the measured peak day, the limit is reached above about 1.8 reads per mint, and that count is a floor [estimate]. Reaching it stops `gh` and, within 55 minutes, git on every lane until the limit resets. Mitigation: the Frame's `DEF-1`.
+- **Rationale:** Per-call minting raises what was a recoverable quota worry to something ordinary use can reach, at least on the lowest tiers. At the 1,000-a-day limit the Frame uses, on the measured peak day, the limit is reached above about 1.8 reads per mint, and that count is a floor [estimate]. Reaching it stops `gh` and, within 55 minutes, git on every lane until the limit resets. Mitigation: the Frame's `DEF-1`.
 - **Trigger (deferred only):** `DEF-1`'s decision rule, evaluated before the run with nobody present, which does not start until the rule's result is recorded (the Frame's `FD-11`); in running, the `FD-9` warning, which fires on the mint count at the same line.
 - **Compensating controls (if any):** not stated in the Frame
 - **Review date:** not stated in the Frame
