@@ -1,0 +1,310 @@
+#!/bin/sh
+set +x +v +a
+# Bash imports an exported function named command, and it would then replace
+# every `command` prefix below, with the token variable in reach. dash imports
+# no functions, so the unset does nothing there.
+unset -f command
+
+# The gh shim for agent sessions. It resolves the session's repository from the
+# harness process, mints a narrowed token for that repository only, and starts
+# the real gh with the token in that one child's environment.
+#
+# This file is a control on a trust boundary and fails closed: every step that
+# cannot be evaluated stops the call. Constraints the code does not show:
+#
+# - The first statement is `set +x +v +a`. An inherited SHELLOPTS=xtrace would
+#   otherwise trace the service-account token the helper holds, and
+#   SHELLOPTS=allexport would export the token variable to every child. The
+#   tests in shim_*_test.go pin this, and so does the lexical check there.
+# - The token lives in one variable that is not GH_TOKEN. GH_TOKEN takes it in
+#   the final exec assignment only. It is never an argument, never printed and
+#   never written to a file. Do not call env here: it would put the token on
+#   env's argv.
+# - Both git reads run in a subshell with every GIT_ variable unset, so an
+#   injected value cannot re-point the repository.
+# - POSIX sh only, and no locale assignments: gh must get the caller's
+#   environment unchanged apart from the variables set below.
+
+# Every name this script assigns carries the private prefix _sgs_, which a caller
+# will not plausibly export: gh must get the caller's environment unchanged (FD-7),
+# so a generic name such as repo or name is never the shim's. Each prefixed name
+# is unset before its first assignment, because a variable of the same name that
+# arrived exported keeps its export mark through the assignment, and gh and the
+# helper would get the shim's value. A variable added to the script is added to
+# this line, with the prefix;
+# TestShim_InternalNamesAreNotExportedToGH fails when one is missing.
+unset _sgs_nl _sgs_tab _sgs_cr _sgs_class _sgs_cwd _sgs_cwd_lines _sgs_cwd_out _sgs_daily_limit _sgs_dir _sgs_file _sgs_gv _sgs_mint_ended _sgs_mint_rc _sgs_mint_seconds _sgs_mint_started _sgs_name _sgs_names _sgs_now _sgs_origin _sgs_owner _sgs_reads_per_mint_tenths _sgs_real _sgs_record_ok _sgs_repo _sgs_rest _sgs_same _sgs_top _sgs_url _sgs_vol_day _sgs_vol_dir _sgs_vol_marker _sgs_vol_n _sgs_vol_now _sgs_godebug _sgs_godebug_set _sgs_api_url _sgs_api_url_set _sgs_day
+
+_sgs_nl='
+'
+_sgs_tab=$(printf '\t')
+_sgs_cr=$(printf '\r')
+
+# GODEBUG and SIGIL_GITHUB_API_URL are scrubbed because the helper holds the App
+# JWT: GODEBUG=http2debug=2 makes Go's HTTP client log it to stderr, and the API
+# URL variable sends it to a host the caller chose. gh is not
+# the helper and is not on FD-4's list, so it gets both exactly as inherited:
+# their set-ness and values are saved here and restored before the exec.
+_sgs_godebug_set=${GODEBUG+1}
+_sgs_godebug=${GODEBUG-}
+_sgs_api_url_set=${SIGIL_GITHUB_API_URL+1}
+_sgs_api_url=${SIGIL_GITHUB_API_URL-}
+unset BASHOPTS BASH_XTRACEFD GITHUB_TOKEN GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GODEBUG SIGIL_GITHUB_API_URL
+
+fail() {
+  printf 'gh shim: %s: %s\n' "$1" "$2" >&2
+  exit 1
+}
+
+# not_regular PATH succeeds when PATH is a symlink, or exists as anything but a
+# regular file. Opening a FIFO for writing blocks until a reader arrives, which
+# would hang the call that is about to start gh, and a symlink to /dev/null makes
+# a write look like a record while keeping nothing. -h is tested first because -f
+# follows links. The check and the open are separate, so a path swapped between
+# them is not covered; the directory is 0700 and the same user's own.
+not_regular() { command [ -h "$1" ] || { command [ -e "$1" ] && command [ ! -f "$1" ]; }; }
+
+# record OUTCOME REPO MINT_SECONDS appends one line to today's record file.
+# The directory is 0700 and the file 0600, re-applied on every call. A
+# subshell keeps the umask away from the real gh.
+#
+# Every command that can run while the token variable is set goes through
+# `command`, so a shell function of the same name that arrived exported in the
+# environment (bash imports them) is not run with the token in its reach.
+record() {
+  (
+    command umask 077
+    _sgs_now=$(command date -u +%Y-%m-%dT%H:%M:%SZ) || exit 1
+    case $_sgs_day in [0123456789][0123456789][0123456789][0123456789]-[0123456789][0123456789]-[0123456789][0123456789]) ;; *) exit 1 ;; esac
+    _sgs_dir=$HOME/.local/state/sigil/gh-shim
+    _sgs_file=$_sgs_dir/$_sgs_day.log
+    command mkdir -p "$_sgs_dir" || exit 1
+    command chmod 700 "$_sgs_dir" || exit 1
+    if command [ "$1" = minted ]; then _sgs_class=narrowed; else _sgs_class=none; fi
+    if not_regular "$_sgs_file"; then exit 1; fi
+    command printf '%s\t%s\t%s\t%s\t%s\n' "$_sgs_now" "$2" "$_sgs_class" "$1" "$3" >> "$_sgs_file" || exit 1
+    command chmod 600 "$_sgs_file" || exit 1
+  ) 2>/dev/null
+}
+
+# An unwritable record is operations data, not a gate: say so once and go on.
+# _sgs_record_ok is the flag the volume check reads.
+record_or_warn() {
+  if record "$@"; then
+    _sgs_record_ok=1
+  else
+    _sgs_record_ok=0
+    command printf 'gh shim: record: the call record could not be written; the volume count is unavailable for this call\n' >&2
+  fi
+}
+
+# fail_recorded OUTCOME CLASS MESSAGE [MINT_SECONDS]: the class line first,
+# then the record line.
+fail_recorded() {
+  command printf 'gh shim: %s: %s\n' "$2" "$3" >&2
+  record_or_warn "$1" "$_sgs_repo" "${4-}"
+  exit 1
+}
+
+# git_clean runs git with every GIT_-prefixed variable unset, in a subshell.
+# The names come from awk's ENVIRON, so shells that print the exported set in
+# different formats (bash 3.2 as sh, dash) agree. The names are captured first
+# and the sentinel must be the last line: an awk that fails, or dies part way,
+# leaves GIT_ variables in place, which would let an injected GIT_DIR re-point
+# the read, so that case stops here instead of running git.
+git_clean() {
+  (
+    set -f
+    IFS=$_sgs_nl
+    _sgs_names=$(awk 'BEGIN { for (k in ENVIRON) if (index(k, "GIT_") == 1) print k; print "--end--" }') || exit 1
+    case $_sgs_names in
+      --end--) _sgs_names= ;;
+      *"$_sgs_nl--end--") _sgs_names=${_sgs_names%"$_sgs_nl--end--"} ;;
+      *) exit 1 ;;
+    esac
+    for _sgs_gv in $_sgs_names; do
+      unset -v "$_sgs_gv" || exit 1
+    done
+    exec git "$@"
+  )
+}
+
+# valid_half accepts [A-Za-z0-9_.][A-Za-z0-9_.-]*, neither . nor .., with the
+# characters spelled out so no locale can widen a range.
+valid_half() {
+  case $1 in
+    ''|.|..|-*) return 1 ;;
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Step 1: HOME.
+case ${HOME-} in
+  /*) ;;
+  *) fail home 'HOME is unset, empty or not an absolute path' ;;
+esac
+case $HOME in
+  *"$_sgs_nl"*) fail home 'HOME holds a newline' ;;
+esac
+
+# Step 2: the real gh.
+_sgs_real=${SIGIL_GH_REAL-}
+if [ -z "$_sgs_real" ] && [ -r "$HOME/.config/sigil/gh-real-path" ]; then
+  IFS= read -r _sgs_real < "$HOME/.config/sigil/gh-real-path" || :
+fi
+case $_sgs_real in
+  /*) ;;
+  *) fail real-gh 'no absolute real gh path from SIGIL_GH_REAL or the install-time setting' ;;
+esac
+case $_sgs_real in
+  *"$_sgs_nl"*) fail real-gh 'the real gh path holds a newline' ;;
+esac
+if [ ! -f "$_sgs_real" ] || [ ! -x "$_sgs_real" ]; then
+  fail real-gh 'the real gh path is not an executable file'
+fi
+# -ef compares file identity, so a symbolic or hard link to this script is
+# refused too. It exits 1, the same as "different files", when either path
+# cannot be stat'd, so the comparison cannot be told from a pass. $0 is checked
+# first: a $0 that cannot be stat'd fails closed. ($_sgs_real was checked above.)
+[ -e "$0" ] || fail real-gh 'this shim'\''s own path could not be examined'
+_sgs_same=0
+[ "$_sgs_real" -ef "$0" ] || _sgs_same=$?
+if [ "$_sgs_same" -ne 1 ]; then
+  fail real-gh 'the real gh path is this shim, or could not be compared with it'
+fi
+
+# The UTC day is read once, before the first record can be written, and names
+# both the record's file and the count in step 7: a call that crosses UTC
+# midnight then writes and counts in the same file. A line's own time field is
+# read when it is written, so it can name the next day. record refuses a day
+# that is not date-shaped, so an unreadable clock is an unwritable record.
+_sgs_day=$(command date -u +%Y-%m-%d) || _sgs_day=
+
+# Step 3: the session's repository, from the harness process's directory.
+_sgs_repo=
+case ${CLAUDE_PID-} in
+  ''|*[!0123456789]*) fail_recorded no-repo no-repo 'CLAUDE_PID is not a process id' ;;
+esac
+_sgs_cwd_out=$(lsof -a -p "$CLAUDE_PID" -d cwd -Fn 2>/dev/null) || fail_recorded no-repo no-repo 'the harness process directory could not be read'
+_sgs_cwd_lines=$(printf '%s\n' "$_sgs_cwd_out" | grep -c '^n')
+[ "$_sgs_cwd_lines" -eq 1 ] || fail_recorded no-repo no-repo 'the harness process directory is not exactly one path'
+_sgs_cwd=$(printf '%s\n' "$_sgs_cwd_out" | grep '^n')
+_sgs_cwd=${_sgs_cwd#n}
+case $_sgs_cwd in
+  /*) ;;
+  *) fail_recorded no-repo no-repo 'the harness process directory is not an absolute path' ;;
+esac
+_sgs_top=$(git_clean -C "$_sgs_cwd" rev-parse --show-toplevel 2>/dev/null) || fail_recorded no-repo no-repo 'the harness process is not inside a git work tree'
+[ -n "$_sgs_top" ] || fail_recorded no-repo no-repo 'the harness process is not inside a git work tree'
+_sgs_origin=$(git_clean -C "$_sgs_cwd" config --local --get remote.origin.url 2>/dev/null) || fail_recorded no-repo no-repo 'the clone has no origin'
+case $_sgs_origin in
+  *"$_sgs_nl"*|*"$_sgs_cr"*) fail_recorded no-repo no-repo 'origin holds a line break' ;;
+esac
+_sgs_url=${_sgs_origin%.git}
+case $_sgs_url in
+  https://github.com/*/*) ;;
+  *) fail_recorded no-repo no-repo 'origin is not an https github.com URL' ;;
+esac
+_sgs_rest=${_sgs_url#https://github.com/}
+_sgs_owner=${_sgs_rest%%/*}
+_sgs_name=${_sgs_rest#*/}
+case $_sgs_name in
+  */*) fail_recorded no-repo no-repo 'origin is not owner/repo' ;;
+esac
+valid_half "$_sgs_owner" && valid_half "$_sgs_name" || fail_recorded no-repo no-repo 'origin owner or repo name is not valid'
+_sgs_repo=$_sgs_owner/$_sgs_name
+
+# Step 4: subcommands that would reach the login or persist code.
+case ${1-} in
+  auth|extension|extensions|ext) fail_recorded refused refused 'this gh subcommand is not available through the shim' ;;
+esac
+
+# Step 5: the mint. The helper's stderr passes through. The unset keeps a
+# variable of this name that arrived exported from reaching the children
+# started before the exec.
+unset _sgs_tok
+_sgs_mint_started=$(date +%s)
+# The clock's output goes into shell arithmetic, where a value such as x[$(cmd)]
+# runs cmd, so only whole seconds are accepted. A leading zero is refused too
+# (the 0?* arms here and in the volume count): the shell reads 08 as an invalid
+# octal number and aborts the arithmetic with no class line. The starting reading is checked
+# before the helper runs, so a bad clock refuses before a token is minted and
+# dropped; the record then carries no mint_seconds, as for any call with no mint.
+case $_sgs_mint_started in
+  ''|0?*|*[!0123456789]*) fail_recorded mint-failed mint-failed 'the clock did not print whole seconds' ;;
+esac
+_sgs_mint_rc=0
+_sgs_tok=$(sigil-helper token --landing "$_sgs_repo" </dev/null) || _sgs_mint_rc=$?
+_sgs_mint_ended=$(command date +%s)
+case $_sgs_mint_ended in
+  ''|0?*|*[!0123456789]*) fail_recorded mint-failed mint-failed 'the clock did not print whole seconds' ;;
+esac
+_sgs_mint_seconds=$((_sgs_mint_ended - _sgs_mint_started))
+if command [ "$_sgs_mint_rc" -ne 0 ]; then
+  fail_recorded mint-failed mint-failed 'sigil-helper token --landing failed' "$_sgs_mint_seconds"
+fi
+case $_sgs_tok in
+  ''|*" "*|*"$_sgs_tab"*|*"$_sgs_cr"*|*"$_sgs_nl"*) fail_recorded mint-failed mint-failed 'sigil-helper did not print exactly one token line' "$_sgs_mint_seconds" ;;
+esac
+
+# Step 6: the record.
+record_or_warn minted "$_sgs_repo" "$_sgs_mint_seconds"
+
+# Step 7: the volume check (R-23, R-24). It is skipped when the record could not
+# be written (R-22), since today's file is then not a count of anything. Every
+# failure here is operations data: say so on one line and go on.
+#
+# Fires when (N + 52) x reads-per-mint >= 70% of the daily limit, where 52
+# stands in for `sigil get`'s mints, which the record does not count. Integer
+# arithmetic only: reads-per-mint is held in tenths and 70% of the limit in
+# tenths is 7 x limit, so there is no truncation. 3.0 and 1000 give 182. A
+# change to either constant recomputes the figures in the tests.
+_sgs_reads_per_mint_tenths=30
+_sgs_daily_limit=1000
+
+if command [ "$_sgs_record_ok" -eq 1 ]; then
+  _sgs_vol_day=$_sgs_day
+  _sgs_vol_dir=$HOME/.local/state/sigil/gh-shim
+  _sgs_vol_n=
+  if command [ -n "$_sgs_vol_day" ]; then
+    _sgs_vol_n=$(command awk -F '\t' '$4 == "minted" { n++ } END { print n + 0 }' "$_sgs_vol_dir/$_sgs_vol_day.log" 2>/dev/null) || _sgs_vol_n=
+  fi
+  case $_sgs_vol_n in
+    ''|0?*|*[!0123456789]*)
+      command printf 'gh shim: volume: today'\''s minted count could not be read; the volume check is unavailable for this call\n' >&2
+      ;;
+    *)
+      if command [ $(((_sgs_vol_n + 52) * _sgs_reads_per_mint_tenths)) -ge $((7 * _sgs_daily_limit)) ]; then
+        _sgs_vol_marker=$_sgs_vol_dir/$_sgs_vol_day.warned
+        # Noclobber makes the creation exclusive (O_EXCL): whichever shim
+        # creates the marker is the one that prints. The creation is separate
+        # from the content so that "already there" and "could not create"
+        # stay distinguishable. A marker path that is already a FIFO or a link is
+        # refused first: bash's noclobber opens an existing FIFO and blocks.
+        if not_regular "$_sgs_vol_marker"; then
+          command printf 'gh shim: volume: the warning marker path is not a regular file; the warning is not recorded\n' >&2
+        elif ( set -C; command umask 077; : > "$_sgs_vol_marker" ) 2>/dev/null; then
+          command printf 'gh shim: volume warning: %s minted calls today, at an assumed %s.%s reads per mint against an assumed daily limit of %s; report this to the maintainer\n' "$_sgs_vol_n" $((_sgs_reads_per_mint_tenths / 10)) $((_sgs_reads_per_mint_tenths % 10)) "$_sgs_daily_limit" >&2
+          _sgs_vol_now=$(command date -u +%Y-%m-%dT%H:%M:%SZ) || _sgs_vol_now=
+          command printf '%s\t%s\n' "$_sgs_vol_now" "$_sgs_vol_n" > "$_sgs_vol_marker" 2>/dev/null ||
+            command printf 'gh shim: volume: the warning marker could not be written\n' >&2
+        elif command [ -f "$_sgs_vol_marker" ] && command [ ! -h "$_sgs_vol_marker" ]; then
+          : # another call printed today's warning
+        else
+          command printf 'gh shim: volume: the warning marker could not be created; the warning is not recorded\n' >&2
+        fi
+      fi
+      ;;
+  esac
+fi
+
+# GODEBUG and SIGIL_GITHUB_API_URL go back to gh as they were inherited (FD-7):
+# exported when they were set, an empty value included, and absent when they
+# were not. The helper has run, so neither can reach the App JWT now.
+if command [ -n "$_sgs_godebug_set" ]; then GODEBUG=$_sgs_godebug; command export GODEBUG; fi
+if command [ -n "$_sgs_api_url_set" ]; then SIGIL_GITHUB_API_URL=$_sgs_api_url; command export SIGIL_GITHUB_API_URL; fi
+
+# Step 8: hand over. The assignment prefix puts the token in gh's environment
+# and nowhere else.
+GH_TOKEN=$_sgs_tok GH_CONFIG_DIR=$HOME/.config/sigil/gh XDG_DATA_HOME=$HOME/.local/share/sigil/gh-data GH_PROMPT_DISABLED=1 exec "$_sgs_real" "$@"

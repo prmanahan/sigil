@@ -5,7 +5,7 @@ agent runs reach GitHub without a human unlocking the 1Password desktop app. Bui
 reviewed, shipped, and in daily use since. Home: `github.com/prmanahan/sigil`. Licensed Apache-2.0
 (`LICENSE`).
 
-Single flat Go package, 26 Go files, ~6.7k lines.
+Single flat Go package, 39 Go files, ~11.1k lines (`git ls-files '*.go' | wc -l`, `cat *.go | wc -l`, 2026-11-25).
 
 ## Read this before treating anything here as settled
 
@@ -36,6 +36,8 @@ Flat `package main` at the repo root. No `cmd/`, no `internal/`, no subpackages.
 | `.gitleaksignore` | One entry: a known false positive on a test fixture string. Together with the inline `// gitleaks:allow` on the same fixture in `token_narrow_test.go`, it configures the secret scan, which two things run: the `.githooks/pre-commit` hook (`gitleaks git --staged`) and `just secret-scan` (`gitleaks git` for history, then `gitleaks dir` for the tree, **run by hand**). The CI workflow does not run it. Keep both; do not widen either. ⚠ **The `.gitleaksignore` entry is commit-keyed**, so it suppresses only the history scan; the inline `gitleaks:allow` is what covers the staged and tree scans. Measured: the tree scan with `--ignore-gitleaks-allow` reports 1 finding despite the entry (the staged case is inferred from the entry's commit-keyed form, not run) |
 | `.githooks/pre-commit` | Secret scan of the staged change, failing closed: an unreadable staged set (a plain `git diff --cached` preflight), a missing `gitleaks`, a scan error, a finding, **or an `ERR`-level line on gitleaks' stderr even at exit 0** all refuse the commit; only exit 0 and no `ERR` line passes. ⛔ **The stderr check is load-bearing — do not remove it as redundant.** gitleaks 8.30.1 logs a failure of its own git step (measured: `GIT_INDEX_FILE=/dev/null`) at `ERR` and still exits 0 with `no leaks found`, so its exit status alone reads an unscanned change as clean. ⚠ **Per-clone and locally bypassable, and `git commit` only** — `just hooks` installs a *copy* into the clone's git hooks dir (never committed, so it does not travel with a clone), a later edit to `.githooks/pre-commit` needs a re-run, and `git commit --no-verify` skips it. A velocity aid, not a boundary; CI does not run the scan, so no CI layer backs it. Needs `gitleaks` on `PATH` (8.30.1 measured). `precommit_hook_test.go` pins the decision logic with stub `git`/`gitleaks` in the default gate; it does not run a real gitleaks |
 | `.githooks/gitleaks-tree.toml` | Config for `just secret-scan`'s tree half only (explicit `-c`, never auto-loaded): default rules plus an allowlist of `^\.claude/worktrees/` so sibling worktrees do not produce false hits. Deliberately not a root `.gitleaks.toml`, which gitleaks would load for every scan, the hook included |
+| `shim/gh` | The `gh` shim for agent sessions: a POSIX `#!/bin/sh` script, run in place by the tests and deployed by hand (not by any recipe). It resolves the session's repository from the harness process (`CLAUDE_PID` → `lsof` cwd → the clone's `origin`), mints through `sigil-helper token --landing`, and `exec`s the real `gh` with the token in that one child's environment. It is a control on a trust boundary and a **control surface**: review a change to it as one, and widen narrowly. Invariants and traps are in *The `gh` shim*, below |
+| `shim_*_test.go` | The shim's tests (`package main_test`). `shim_harness_test.go` builds a fixture per test: fakes for `sigil-helper`, the real `gh` and (on Linux) `lsof`, a fake harness process, and a PATH and environment built from scratch. `shim_static_test.go` is the lexical check of R-14 over the script's text, with its 20 seeded copies; `shim_secret_test.go` holds the three *macOS runtime* tests |
 | **Control surfaces** | `.githooks/`, `.githooks/gitleaks-tree.toml` and `.gitleaksignore` decide what the secret scan sees or suppresses; `.github/**`, the justfile's `ci`/`check`/`test`/`vet`/`fmt-check` recipes and the `go` line in `go.mod` decide what CI checks, because under `pull_request` a PR's own workflow and justfile define its check. A change to any of them is a change to a control: review it as one, and widen narrowly (never disable) |
 
 ⚠ **`unexported` buys nothing here.** One package, no import boundary — every identifier is
@@ -52,12 +54,14 @@ just check
 ```
 
 Chains `vet` → `fmt-check` → `test` (`go vet ./...`, `test -z "$(gofmt -l .)"`,
-`go test ./...`). **Measured 2026-11-25 after `go clean -testcache`: all green, exit 0, ~6 s
-cold. 137 top-level tests pass, 2 skip, 0 fail.**
+`go test ./...`). **Measured 2026-11-25: all green, exit 0, 48 s wall
+(`go test -count=1 -v ./...`, 14:24:24 to 14:25:12 UTC). 225 top-level tests pass, 3 skip, 0 fail.**
 ⚠ **State the counting method, because it has already drifted once**: this number is
 top-level only — `go test -count=1 -v ./...` then `grep -c '^--- PASS'` and `'^--- SKIP'`,
-which counts neither subtests nor `TestMain`. The tree holds 140 `func Test` (`grep -h '^func Test' *_test.go | wc -l`); one is `TestMain`,
-leaving 139 top-level tests = 137 pass + 2 skip (2026-11-25, same method).
+which counts neither subtests nor `TestMain`. The tree holds 229 `func Test` (`cat *_test.go | grep -c '^func Test'`); one is `TestMain`,
+leaving 228 top-level tests = 225 pass + 3 skip (2026-11-25, same method). The three skips are
+`TestCLI_HelperGet_ValidGitHubPath`, `TestCLI_LeakScan_TokenNotInStderr` and
+`TestCLI_Landing_LeakScan_TokenOnStdoutOnly`, all gated on the 1Password variables.
 **`just ci` is `check` plus `govulncheck`, and it is what GitHub runs** (`.github/workflows/ci.yml`, on
 `ubuntu-latest` and `macos-latest`); run it locally before opening a PR. ⚠ **Measured locally 2026-11-11; GitHub runs since are listed below:**
 `just ci` on go directive 1.26.10, 14:52:55 to 14:53:04, exited 1 (govulncheck found GO-2026-6859, exit 3); at e99273b on
@@ -71,7 +75,7 @@ behaviour, not on anything observed here.
 The Linux job skips the pty CLI tests (they run only on darwin), so the macOS job is *expected* to be
 the one with pty coverage; ⚠ **that is not confirmed on the hosted runner**: CI runs `go test` without `-v`, so the
 logs do not show a skip or a run.
-⛔ **The skip count is 2 on macOS, gated on `OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`**,
+⛔ **The skip count is 3 on macOS (2026-11-25), gated on `OP_SERVICE_ACCOUNT_TOKEN` + `SIGIL_TEST_OP_KEY_REF`**,
 and the two skipped tests below remain the only coverage of the happy path and the end-to-end
 stderr leak scan. ⚠ **Those two are the only skips measured, and they are not the only ones
 possible.** Three more are platform-conditional and did not skip on macOS: the two CLI pty tests
@@ -402,6 +406,101 @@ Stated in `main.go`'s header comment. Each names what breaking it costs.
   the user already owns is enough; and `/dev/null` is a character device, so that redirect is
   permitted. The gate narrows the *accidental* case to a loud failure. An agent permission rule is
   what keeps this command out of unattended runs, and nothing here replaces it.
+
+## The `gh` shim (`shim/gh`) — do not regress these
+
+Not wired into any session until a hand deploy; the spec is `docs/specs/lead-session-gh-token.md`
+(R-8 to R-24, R-39).
+
+- **The token reaches `gh` only as an assignment prefix on the final `exec`.** Never argv, never
+  printed, never in a file. The token variable is `_sgs_tok`, not `GH_TOKEN`; `GH_TOKEN`
+  takes it in the hand-off only. ⛔ **Do not call `env` in the script**: `env GH_TOKEN=… gh` puts the
+  token on `env`'s argv, where `ps` shows it.
+- **`set +x +v +a` is the first statement, and the first line is exactly `#!/bin/sh`.** An inherited
+  `SHELLOPTS=xtrace` would trace the helper's service-account token, and `allexport` would export the
+  token variable to every child. Both are *macOS runtime* only: Linux `dash` ignores `SHELLOPTS`, so
+  CI's Linux job skips the three tests that prove it. ⚠ **CI runs `go test` without `-v`, so a skip is
+  invisible there**: read the macOS `-v` output as the spec's "Where each criterion runs" says.
+- **`unset _sgs_tok` before the capture is load-bearing.** A variable of that name that
+  arrived exported would otherwise keep its export mark and carry the token to the children the
+  shim starts before the `exec`. `TestShim_R14_InheritedExportOfTheTokenVariable` fails without it.
+- **Both git reads run in a subshell with every `GIT_`-prefixed variable unset**, with the names read
+  from `awk`'s `ENVIRON`, because `export -p` prints differently under macOS `/bin/sh` (bash 3.2) and
+  Linux `dash`. Do not "simplify" this to `env -u` (banned) or to a named list.
+- **It fails closed with one `gh shim: <class>:` line** (`home`, `real-gh`, `no-repo`, `refused`,
+  `mint-failed`). The helper's stderr passes through, so a `mint-failed` call can write more than one
+  line. An unwritable record warns once (`gh shim: record:`) and never stops the call.
+- **The volume warning (step 7) fires when `(N + 52) x reads_per_mint_tenths >= 7 x daily_limit`**, in
+  integers: 182 at the shipped 30 tenths and 1000, 154 at 34. The two constants are single assignment
+  lines in the script and the tests edit copies by those exact lines. ⛔ **A change to either constant
+  recomputes R-23's two figures in the same change** (`shim_volume_test.go`'s property test follows
+  the inequality, but the 182 and 154 tests name the numbers). The marker (`<UTC date>.warned`, one
+  line `<time>\t<N>`, `0600`) is created with noclobber, so the shim that creates it is the one that
+  prints. An unwritable record skips the check (R-22); a failure inside it prints one
+  `gh shim: volume:` line and continues. The marker's reader is parked, human-noticed, monthly (D14).
+  **One UTC day per call:** `_sgs_day` is read once, before step 3's first possible record, and names
+  the record's file, the count's file and the marker. A call crossing UTC midnight therefore writes
+  and counts in one file; only the line's own time field, read when it is written, can name the next
+  day. `record` refuses a `_sgs_day` that is not `dddd-dd-dd` (an unreadable clock is an unwritable
+  record). `TestShim_R21_R23_ACallCrossingMidnightUsesOneDay` injects a `date` that changes day.
+  **A non-regular record log or marker is refused, not opened** (`not_regular`: a symlink, or anything
+  that exists and is not a regular file): a FIFO would block the call before `gh`, and a link to
+  `/dev/null` would look recorded. The record's refusal prints `gh shim: record:`, the marker's
+  `gh shim: volume:`, and the call goes on. ⚠ The check and the open are separate (a swap between
+  them is not covered; the directory is the same user's, `0700`). The marker-FIFO hang itself is
+  bash-only (dash's noclobber is `O_EXCL` and fails instead of blocking).
+- **No `set -e`, no locale assignment, and the only `export` is the restore of `GODEBUG` and
+  `SIGIL_GITHUB_API_URL` (below).** The real `gh` must get the caller's environment unchanged apart
+  from FD-4's list (FD-7).
+- **The static check is lexical and says so.** `shim_static_test.go` fails closed on syntax it does not
+  understand (backticks, line continuations), so a harmless-looking rewrite of the script may need the
+  check taught the new shape first. Its 20 seeded copies are anchored on the script's exact lines; an
+  edit to an anchored line fails the seeds loudly (anchor not found) rather than silently.
+- **Known gap, accepted:** R-12's exactly-one-line holds up to trailing empty lines: command
+  substitution strips them, and R-14's capture shape forecloses checking. The same applies to the
+  `origin` read. Accepted by the maintainer as a spec erratum, 2026-11-25.
+- **R-39 compares file identity only** (`-ef`, plus a `[ -e "$0" ]` guard because `-ef` answers
+  false, not an error, for a path it cannot stat). A real-`gh` path that is a wrapper running `gh`
+  from `PATH` re-enters the shim and mints on every pass. That limit is recorded, not checked.
+- **FD-7: `gh` gets the caller's environment unchanged apart from FD-4's list.** Four mechanisms
+  hold that and the helper's protection together.
+  - **`GODEBUG` and `SIGIL_GITHUB_API_URL` are absent from the helper, and exact for `gh`.** The helper
+    holds the App JWT: `GODEBUG=http2debug=2` makes Go's HTTP client log it to stderr, and the API URL
+    variable sends it to a host the caller chose. Their set-ness and values are saved (`_sgs_godebug_set`,
+    `_sgs_godebug`, `_sgs_api_url_set`, `_sgs_api_url`) before the `unset`, and exported again after
+    step 7, before the `exec`: set (an empty value included) if they were set, absent if not.
+    `TestShim_FD7_GodebugAndAPIURLReachGHAsInherited` and
+    `TestShim_R13_HelperEnvironment_DebugAndAPIURLAreScrubbed` pin both halves. ⛔ **Decided, not open:** `BASHOPTS` and
+    `BASH_XTRACEFD` are removed before the helper runs and are absent from `gh`'s environment too.
+    Locked spec R-13 requires the removal and a test that they are absent from `gh`; the lead ruled
+    (2026-11-25) that the spec is the governing text over FD-7's general rule, so FD-7's "unchanged"
+    does not restore them.
+  - **Every variable the script assigns starts with `_sgs_`**, a prefix a caller will not plausibly
+    export, and the top `unset` line covers only those names. A caller-exported `name`, `url`, `repo`,
+    `dir`, `file`, `class`, `now` or `top` reaches `gh` unchanged
+    (`TestShim_FD7_CallerExportedGenericNamesReachGHUnchanged`); a prefixed name that arrives exported
+    is unset before its first assignment, so the shim's value does not leak
+    (`TestShim_InternalNamesAreNotExportedToGH` derives the names from the script, fails on one without
+    the prefix and on a miss in the `unset` line). A new variable takes the prefix and joins the line.
+  - **`command` in front of every command that runs after the token capture**, so an exported shell
+    function of that name (bash imports `BASH_FUNC_name%%`; dash does not) cannot read the token
+    variable; and **`unset -f command`** right after `set +x +v +a`, because bash lets an exported
+    function replace `command` itself (measured 2026-11-25, macOS `/bin/sh`; Warden measured that the
+    unset closes it under bash 3.2 and is harmless under dash). `export` needs no prefix: a special
+    builtin is found before a function in posix mode (measured: the shadowing test's control copy
+    cannot make an `export` function run).
+  - **The clock's two readings are digits, checked before the arithmetic**, because a value such as
+    `x[$(cmd)]` runs `cmd` there, and a leading zero (`0?*` arm) is refused too, because `08` aborts
+    `$(( ))` with no class line. The same arm guards the minted count. A bad reading is refused as
+    `mint-failed` with an empty `mint_seconds`. **The starting reading is checked before the helper
+    runs**, so a bad clock refuses before any token is minted and dropped; the record is a
+    `mint-failed` line with empty `mint_seconds` (the Data Model's "empty when no mint was attempted").
+    The ending reading, checked after the mint, is recorded the same way.
+- **`git_clean` fails closed when `awk` fails**: the names are captured first and the sentinel
+  `--end--` must be the last line, so an `awk` that errors or dies part way refuses as `no-repo`
+  instead of running git with an injected `GIT_DIR` in place.
+- **The Linux fake `lsof` in `shim_harness_test.go` is checked on macOS only through a `/proc`-like
+  fixture** (`shim_lsof_fake_test.go`). CI's ubuntu job is the only run against the real `/proc`.
 
 ## Per-repo gotchas
 
