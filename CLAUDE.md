@@ -5,7 +5,7 @@ agent runs reach GitHub without a human unlocking the 1Password desktop app. Bui
 reviewed, shipped, and in daily use since. Home: `github.com/prmanahan/sigil`. Licensed Apache-2.0
 (`LICENSE`).
 
-Single flat Go package, 24 Go files, ~5.5k lines.
+Single flat Go package, 26 Go files, ~6.7k lines.
 
 ## Read this before treating anything here as settled
 
@@ -25,8 +25,9 @@ Flat `package main` at the repo root. No `cmd/`, no `internal/`, no subpackages.
 | `exchange.go` | The App-JWT → installation-token HTTP exchange (nil body, full permissions), and the `errUnauthorized` sentinel |
 | `token.go` | The seven-step orchestrator; the only file that composes routing + cache + jwt + exchange |
 | `token_narrow.go` | `sigil token --rate-limit-only`: the fixed-body (`{"permissions":{"metadata":"read"},"repositories":[repo]}`) access_tokens POST, `verifyNarrowedGrant`'s exact-match check against GitHub's actual response, and revoke-on-mismatch. Sibling to `token.go`/`exchange.go` — never imports `cache.go` |
+| `token_landing.go` | `sigil token --landing <owner>/<repo>`: the landing mint. The fixed five-permission body (`contents` write, `pull_requests` write, `checks` read, `workflows` write, `metadata` read, plus `repositories: [repo]`), `verifyLandingGrant`'s exact-match check against GitHub's actual response (a private repository is allowed; the repository name is matched exactly, letter case included), and revoke-on-mismatch through `token_narrow.go`'s `revokeNarrowedToken`, unchanged. Sibling to `token_narrow.go`, whose three function bodies it copies rather than shares — never imports `cache.go` |
 | `cache.go` | On-disk token cache, `0600`-enforced. Only `token.go`'s full-permission path reads/writes it |
-| `*_test.go` | Tests. `credential_channel_test.go` pins the stdout/stderr channel separation of `writeCredentialResponse`; `parse_key_test.go` covers `parseRSAPrivateKey`; `lazy_key_test.go` and `cli_cache_test.go` pin the routing → cache → key-read order |
+| `*_test.go` | Tests. `credential_channel_test.go` pins the stdout/stderr channel separation of `writeCredentialResponse`; `parse_key_test.go` covers `parseRSAPrivateKey`; `token_landing_test.go` covers the landing mint (verifier as a property over single-field perturbations, request body, revoke, cache, stream silence of `getLandingToken`, `dispatchToken`'s three forms and their order); `lazy_key_test.go` and `cli_cache_test.go` pin the routing → cache → key-read order |
 | `justfile` | `build` · `test` · `vet` · `fmt` · `fmt-check` · `check` · `ci` (`check`, then `govulncheck` at a pinned version: exactly what GitHub CI runs, so run it before opening a PR) · `hooks` (installs a COPY of the pre-commit hook into the clone's git hooks dir) · `secret-scan` (full history and tree scan). Neither `hooks` nor `secret-scan` is part of `check` or `ci`. ⚠ **No `install` recipe** |
 | `.github/workflows/ci.yml` | The CI workflow: `pull_request`, `push` to `main` and a weekly `schedule`, `permissions: contents: read`, no secrets, a job timeout and a concurrency group. One job on `ubuntu-latest` and `macos-latest` that checks out, sets up Go from `go.mod`, installs `just` and runs `just ci`. `just` 1.59.0 is downloaded from its casey/just release by a plain `run:` step and checked against a SHA-256 committed in the workflow matrix (from the release's `SHA256SUMS`, cross-checked by hashing the downloaded asset); a mismatch fails the step. It is not `extractions/setup-just`, which sibling repos use, because that action does not verify its download; a `just` bump means re-reading both hashes. The only actions used are GitHub's own, `actions/checkout` and `actions/setup-go`, pinned to a full commit SHA with the tag in a comment; a bump re-reads the SHA from the action's repository. `.github/dependabot.yml` proposes weekly `github-actions` updates (not `gomod`). `govulncheck` is pinned in the `ci` recipe, so a bump is a justfile change |
 | `config.example.toml` | The template. Non-secret fields only; its comments carry the secret-boundary rationale |
@@ -51,12 +52,12 @@ just check
 ```
 
 Chains `vet` → `fmt-check` → `test` (`go vet ./...`, `test -z "$(gofmt -l .)"`,
-`go test ./...`). **Measured 2026-11-09 after `go clean -testcache`: all green, exit 0, ~11 s
-cold. 113 top-level tests pass, 2 skip, 0 fail.**
+`go test ./...`). **Measured 2026-11-25 after `go clean -testcache`: all green, exit 0, ~6 s
+cold. 137 top-level tests pass, 2 skip, 0 fail.**
 ⚠ **State the counting method, because it has already drifted once**: this number is
 top-level only — `go test -count=1 -v ./...` then `grep -c '^--- PASS'` and `'^--- SKIP'`,
-which counts neither subtests nor `TestMain`. The tree holds 116 `func Test`; one is `TestMain`,
-leaving 115 top-level tests = 113 pass + 2 skip.
+which counts neither subtests nor `TestMain`. The tree holds 140 `func Test` (`grep -h '^func Test' *_test.go | wc -l`); one is `TestMain`,
+leaving 139 top-level tests = 137 pass + 2 skip (2026-11-25, same method).
 **`just ci` is `check` plus `govulncheck`, and it is what GitHub runs** (`.github/workflows/ci.yml`, on
 `ubuntu-latest` and `macos-latest`); run it locally before opening a PR. ⚠ **Measured locally 2026-11-11; GitHub runs since are listed below:**
 `just ci` on go directive 1.26.10, 14:52:55 to 14:53:04, exited 1 (govulncheck found GO-2026-6859, exit 3); at e99273b on
@@ -117,8 +118,9 @@ runs `sigil get` with no service-account token, and asserts the token is on stdo
 empty — so a token printed to stderr anywhere on **`sigil get`'s cache-hit path** (config load,
 routing, cache read, output) now fails the gate. **What it does NOT cover:** the cache-**miss**
 path — the mint, the 401 retry, `exchange.go`, error formatting after a key read — and
-`sigil token <owner>`'s and `--rate-limit-only`'s stderr (the pty test only checks the cached
-token appears; it does not assert stderr), and `doctor`. A `fmt.Fprintln(os.Stderr, token)` added
+`sigil token <owner>`'s, `--rate-limit-only`'s and `--landing`'s (`cmdTokenLanding`) stderr (the pty
+test only checks the cached token appears; it does not assert stderr; `getLandingToken` alone is
+covered under `captureStd`, the built-binary `--landing` path is not), and `doctor`. A `fmt.Fprintln(os.Stderr, token)` added
 on any of those still leaves `just check` green. The wider invariant ("the token leaves by exactly
 one channel") for those paths remains carried by the skip-gated `TestCLI_LeakScan_TokenNotInStderr`
 plus convention; it is **not** closed. Closing it needs an in-gate run of the built binary that
@@ -310,8 +312,9 @@ Stated in `main.go`'s header comment. Each names what breaking it costs.
   chmod leaves a pre-existing `0644` file at `0644`, holding live GitHub tokens. **This is the
   best-mechanised invariant in the repo** — defensive code, correctly tested, reasoning inline.
 - **The cache holds a token and an expiry, nothing else.**
-- **Routing is fail-closed and runs before any network call and before the key read, on all three
-  token paths** (`sigil get`, `sigil token <owner>`, `sigil token --rate-limit-only`). Unknown
+- **Routing is fail-closed and runs before any network call and before the key read, on all four
+  token paths** (`sigil get`, `sigil token <owner>`, `sigil token --rate-limit-only`,
+  `sigil token --landing`). Unknown
   owner errors; no default installation is ever guessed. ⇒ Breaking it mints a token for the wrong
   installation.
 - **Order on `sigil get` and `sigil token <owner>`: config → API-base scheme check → (token path
@@ -319,8 +322,9 @@ Stated in `main.go`'s header comment. Each names what breaking it costs.
   hit or an unknown owner never reads the key, so never touches 1Password; the key is loaded once
   and reused for the 401 retry (`getInstallationTokenLazy` in `token.go`). ⇒ Breaking it makes
   every `git` operation read 1Password even on a cache hit, and makes an unknown owner fail with a
-  key error instead of the routing error. `--rate-limit-only` is config → scheme check → routing
-  → key read, and never reads the cache.
+  key error instead of the routing error. `--rate-limit-only` and `--landing` are each config →
+  scheme check → routing → key read, never read the cache, and (unlike `token <owner>`) run no
+  terminal check.
   Pinned in the default gate: the key-load order and call counts by `lazy_key_test.go` (key
   loader), and the same order through the built binary with no service-account token by
   `cli_cache_test.go` — cache hit for `get` and `token`, unknown owner for `get` and
@@ -329,9 +333,16 @@ Stated in `main.go`'s header comment. Each names what breaking it costs.
   the gate into the key-loader closure made it fail while the empty-cache refusal test stayed
   green). The scheme-before-key-read part is asserted for `sigil token`
   (`TestCLI_InsecureAPIBaseURL_ExitsNonZero`) and unasserted for `sigil get` and
-  `--rate-limit-only`.
+  `--rate-limit-only`. For `--landing` the scheme-before-routing order is asserted in process
+  (`TestDispatchToken_LandingOrder`), not through the built binary.
+  ⚠ **Not pinned in the default gate: `dispatchToken`'s arm-to-handler wiring for `--landing` and
+  `--rate-limit-only`.** The two handlers share an identical pre-key-read path, so no default-gate
+  test can tell a swapped arm from a correct one. The `--landing` arm is pinned only by T3's
+  skip-gated `TestCLI_Landing_LeakScan_TokenOnStdoutOnly`, and the `--rate-limit-only` arm only by
+  the existing skip-gated `TestCLI_LeakScan_TokenNotInStderr`; in both cases also by the lead's R-6
+  diff read of `dispatchToken`.
   One 30-second context, created before the key read, covers the key read and the API exchange
-  together on all three paths: `readKey` hands it to the 1Password client and the secret
+  together on all four paths: `readKey` hands it to the 1Password client and the secret
   resolution, so a slow key read spends part of the same budget. ⚠ **That deadline bounds the
   1Password network waits, not everything the SDK does.** The WASM core load and guest compute
   are not interrupted: onepassword-sdk-go v0.4.0 sets no manifest timeout (so
@@ -339,13 +350,13 @@ Stated in `main.go`'s header comment. Each names what breaking it costs.
   `context.Background()`. Do not read the 30 s as a ceiling on a run.
   Pinned: `getInstallationTokenLazy` passes the caller's context, deadline included, to the key
   loader (`TestGetInstallationTokenLazy_LoadKeyReceivesCallerContext`). Not pinned: that `readKey`
-  forwards it to the SDK, at its call sites in `cmdGet`, `cmdToken` and `cmdTokenNarrowed`, or
+  forwards it to the SDK, at its call sites in `cmdGet`, `cmdToken`, `cmdTokenNarrowed` and `cmdTokenLanding`, or
   that the SDK aborts on it. The test proves only that the lazy function forwards its context;
   the rest needs real 1Password.
 - **Error messages carry no key or token material.** They quote types, status codes and lengths,
   and also file paths (the cache directory), URLs (the API base) and GitHub response strings (the
   granted permission names, repository name and `repository_selection` in `verifyNarrowedGrant`'s
-  mismatch errors). Wrapped library errors pass the library's own text through unchanged: the
+  and `verifyLandingGrant`'s mismatch errors; never a granted permission level). Wrapped library errors pass the library's own text through unchanged: the
   PEM/DER parse (asserted not to leak key bytes for `parseRSAPrivateKey`), and the 1Password SDK
   errors in `readKey` (client init, secret resolve), the JSON decodes and the HTTP transport
   errors, none of which is asserted.
@@ -362,6 +373,21 @@ Stated in `main.go`'s header comment. Each names what breaking it costs.
   permission including write, and `{"permissions":{"metadata":"read"},"repositories":[]}` to
   select all repositories. Do not weaken `verifyNarrowedGrant` to a single
   `permissions["metadata"]=="read"` check, which passes the first of these silently.
+- **A `--landing` token is verified against GitHub's actual grant before it is trusted or printed,
+  and is never cached.** `token_landing.go`'s `verifyLandingGrant` is exact-match in both
+  directions: the permission map equals the five-permission constant (keys and levels),
+  `repository_selection` is `selected`, exactly one repository is listed, and its name equals the
+  requested one. Any mismatch revokes the token and returns an error carrying key names,
+  `repository_selection` and the repository name, never a granted level or the token. A 201 whose body fails to decode has any decoded token
+  revoked. ⇒ Breaking it lets a widened grant reach stdout. Unlike
+  `--rate-limit-only` it accepts a private repository, and the permission set is a constant: no
+  flag, argument or config field supplies permissions (`dispatchToken` takes only the repository).
+  The repository is the caller's argument: sigil does not pin it to a session, and that pin is the
+  shim's job (RR-7, RISK-B). The constant includes `workflows: write`, which carries RISK-A's
+  indirect reach.
+  ⛔ **`--landing` is write-capable and runs unattended by design** (no terminal check, by the
+  spec). It is the same prose-only coupling as the owner-matching note above: nothing here keeps an
+  agent off it, so an agent permission rule that must do so has to name the `--landing` form.
 - **The full-permission `sigil token <owner>` refuses a non-terminal stdout**, from the
   credential-free preflight band: after the scheme check, before the App key is read, before any
   network call — so a refused run reads no secret and makes no `access_tokens` POST. ⇒ Breaking
